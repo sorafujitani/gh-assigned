@@ -1,0 +1,27 @@
+gh assigned - fuzzy viewer for pull requests that need you
+
+Usage: gh assigned
+
+Tabs
+  Mine              your open PRs, stacked PRs nested under their base
+  Review requested  PRs waiting for your review
+  Assigned          PRs assigned to you
+
+Keys
+  type              fuzzy filter (repo, number, title, author)
+  tab / shift-tab   switch tab
+  up / down         move (also ctrl-p / ctrl-n, ctrl-k / ctrl-j)
+  enter             open the selected PR in the browser and exit
+  O (shift-o)       open the selected PR in the browser and stay
+  Y (shift-y)       copy the selected PR URL to the clipboard
+  N (shift-n)       copy the selected PR number to the clipboard
+  ctrl-r            refetch
+  esc / ctrl-c      quit
+
+The list is drawn inline below the prompt, like fzf, and cleared on exit.
+The last result is cached under the user cache directory and shown
+immediately on start while a fresh fetch runs in the background.
+
+Options
+  --json            fetch once and print all three lists as JSON
+  -h, --help        show this help
