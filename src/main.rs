@@ -18,6 +18,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 /// What one key press asks the event loop to do.
+#[derive(Debug)]
 enum Action {
     Continue,
     Reload,
@@ -25,6 +26,7 @@ enum Action {
 }
 
 /// How the interactive session ended.
+#[derive(Debug)]
 enum Outcome {
     Cancel,
     Open(String),
@@ -168,11 +170,13 @@ fn leave_tui(mut terminal: Tui) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
 enum Msg {
     List(Kind, Result<Vec<github::Pr>>),
     Checks(Kind, Result<HashMap<PrKey, Checks>>),
 }
 
+#[derive(Debug)]
 struct Tagged {
     generation: u64,
     msg: Msg,
@@ -227,6 +231,9 @@ fn run(
         if changed {
             // The cache is only a warm start; failing to write it must not stop the UI.
             let _ = cache::store(app.snapshot());
+            if !app.help {
+                height = grow_viewport(terminal, height, viewport_height(app.rows().len()));
+            }
         }
 
         if !event::poll(POLL_INTERVAL)? {
@@ -260,10 +267,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
     if app.help {
         app.help = false;
         // Dismiss keys stop here; anything else also acts normally so typing is not eaten.
-        if matches!(
-            key.code,
-            KeyCode::Esc | KeyCode::Enter | KeyCode::F(1) | KeyCode::Char('?')
-        ) {
+        let dismiss_only = match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::F(1) => true,
+            KeyCode::Char('?') => app.query.is_empty(),
+            _ => false,
+        };
+        if dismiss_only {
             return Action::Continue;
         }
     }

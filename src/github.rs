@@ -125,7 +125,16 @@ fn search_query(kind: Kind, fields: &str) -> String {
 
 /// Open PRs for one list, with `checks` left as `Checks::None`.
 pub fn fetch_list(kind: Kind) -> Result<Vec<Pr>> {
-    let data: raw::Data<raw::Pr> = graphql(&search_query(kind, PR_FIELDS))?;
+    parse_list(&run_gh(&search_query(kind, PR_FIELDS))?)
+}
+
+/// CI state for one list.
+pub fn fetch_checks(kind: Kind) -> Result<HashMap<PrKey, Checks>> {
+    parse_checks(&run_gh(&search_query(kind, CHECK_FIELDS))?)
+}
+
+fn parse_list(body: &[u8]) -> Result<Vec<Pr>> {
+    let data: raw::Data<raw::Pr> = parse_response(body)?;
     Ok(data
         .search
         .nodes
@@ -135,9 +144,8 @@ pub fn fetch_list(kind: Kind) -> Result<Vec<Pr>> {
         .collect())
 }
 
-/// CI state for one list.
-pub fn fetch_checks(kind: Kind) -> Result<HashMap<PrKey, Checks>> {
-    let data: raw::Data<raw::PrChecks> = graphql(&search_query(kind, CHECK_FIELDS))?;
+fn parse_checks(body: &[u8]) -> Result<HashMap<PrKey, Checks>> {
+    let data: raw::Data<raw::PrChecks> = parse_response(body)?;
     Ok(data
         .search
         .nodes
@@ -169,26 +177,53 @@ pub fn fetch_all() -> Result<Snapshot> {
     Ok(snapshot)
 }
 
-fn graphql<T: for<'de> Deserialize<'de>>(query: &str) -> Result<T> {
+/// Runs a query through `gh`, returning the response body when it holds usable data.
+///
+/// `gh` exits non-zero whenever the response carries `errors`, even alongside
+/// partial `data`, so the body is parsed before the exit status is trusted.
+fn run_gh(query: &str) -> Result<Vec<u8>> {
     let out = Command::new("gh")
         .args(["api", "graphql", "-f"])
         .arg(format!("query={query}"))
         .output()
         .context("failed to run `gh`; is GitHub CLI installed?")?;
-    if !out.status.success() {
-        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    if out.status.success() || has_data(&out.stdout) {
+        return Ok(out.stdout);
     }
-    parse_response(&out.stdout)
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let message = one_line(&stderr);
+    if message.is_empty() {
+        bail!("`gh` exited with {}", out.status);
+    }
+    bail!("{message}")
 }
 
+fn has_data(body: &[u8]) -> bool {
+    serde_json::from_slice::<raw::Response<serde::de::IgnoredAny>>(body)
+        .is_ok_and(|r| r.data.is_some())
+}
+
+/// The info line has one row, so multi-line `gh` output is joined.
+fn one_line(text: &str) -> String {
+    text.lines()
+        .map(|l| l.trim().trim_start_matches("gh: ").trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Partial results win over `errors`: a failing node is dropped, the rest still show.
 fn parse_response<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T> {
     let resp: raw::Response<T> =
         serde_json::from_slice(body).context("unexpected GraphQL response")?;
-    if let Some(errors) = resp.errors {
-        let msgs: Vec<_> = errors.into_iter().map(|e| e.message).collect();
-        bail!("{}", msgs.join("; "));
+    match (resp.data, resp.errors) {
+        (Some(data), _) => Ok(data),
+        (None, Some(errors)) if !errors.is_empty() => {
+            let msgs: Vec<_> = errors.into_iter().map(|e| e.message).collect();
+            bail!("{}", msgs.join("; "))
+        }
+        (None, _) => bail!("GraphQL response has no data"),
     }
-    resp.data.context("GraphQL response has no data")
 }
 
 impl From<&raw::Commits> for Checks {
@@ -207,13 +242,13 @@ impl From<&raw::Commits> for Checks {
     }
 }
 
-impl From<Option<raw::ReviewDecision>> for Review {
-    fn from(decision: Option<raw::ReviewDecision>) -> Self {
+impl From<raw::ReviewDecision> for Review {
+    fn from(decision: raw::ReviewDecision) -> Self {
         match decision {
-            Some(raw::ReviewDecision::Approved) => Review::Approved,
-            Some(raw::ReviewDecision::ChangesRequested) => Review::ChangesRequested,
-            Some(raw::ReviewDecision::ReviewRequired) => Review::Pending,
-            Some(raw::ReviewDecision::Other) | None => Review::None,
+            raw::ReviewDecision::Approved => Review::Approved,
+            raw::ReviewDecision::ChangesRequested => Review::ChangesRequested,
+            raw::ReviewDecision::ReviewRequired => Review::Pending,
+            raw::ReviewDecision::Other => Review::None,
         }
     }
 }
@@ -230,7 +265,7 @@ impl From<raw::Pr> for Pr {
             base_ref: r.base_ref_name,
             head_ref: r.head_ref_name,
             checks: Checks::None,
-            review: Review::from(r.review_decision),
+            review: r.review_decision.map_or(Review::None, Review::from),
         }
     }
 }
@@ -239,28 +274,28 @@ impl From<raw::Pr> for Pr {
 mod raw {
     use serde::Deserialize;
 
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
     pub struct Response<T> {
         pub data: Option<T>,
         pub errors: Option<Vec<GraphqlError>>,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
     pub struct GraphqlError {
         pub message: String,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
     pub struct Data<T> {
         pub search: Search<T>,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
     pub struct Search<T> {
         pub nodes: Vec<Option<T>>,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct Pr {
         pub number: u64,
@@ -274,7 +309,7 @@ mod raw {
         pub review_decision: Option<ReviewDecision>,
     }
 
-    #[derive(Deserialize, Clone, Copy)]
+    #[derive(Debug, Deserialize, Clone, Copy)]
     #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
     pub enum ReviewDecision {
         Approved,
@@ -284,46 +319,46 @@ mod raw {
         Other,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
     pub struct PrChecks {
         pub number: u64,
         pub repository: Repository,
         pub commits: Commits,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct Repository {
         pub name_with_owner: String,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
     pub struct Author {
         pub login: String,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
     pub struct Commits {
         pub nodes: Vec<CommitNode>,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
     pub struct CommitNode {
         pub commit: Commit,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct Commit {
         pub status_check_rollup: Option<Rollup>,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
     pub struct Rollup {
         pub state: RollupState,
     }
 
-    #[derive(Deserialize, Clone, Copy)]
+    #[derive(Debug, Deserialize, Clone, Copy)]
     #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
     pub enum RollupState {
         Success,
@@ -340,32 +375,49 @@ mod raw {
 mod tests {
     use super::*;
 
-    fn parse_prs(body: &str) -> Result<Vec<Pr>> {
-        let data: raw::Data<raw::Pr> = parse_response(body.as_bytes())?;
-        Ok(data
-            .search
-            .nodes
-            .into_iter()
-            .flatten()
-            .map(Pr::from)
-            .collect())
+    #[test]
+    fn tab_order_matches_list_index() {
+        for (i, kind) in Kind::ALL.into_iter().enumerate() {
+            assert_eq!(kind.index(), i, "{kind:?}");
+        }
     }
 
     #[test]
-    fn graphql_errors_become_one_message() {
-        let body = r#"{"data":null,"errors":[{"message":"a"},{"message":"b"}]}"#;
-        let err = parse_prs(body).unwrap_err();
-        assert_eq!(err.to_string(), "a; b");
+    fn search_query_carries_filter_and_page_size() {
+        let q = search_query(Kind::ReviewRequested, PR_FIELDS);
+        assert!(q.contains("review-requested:@me"), "{q}");
+        assert!(q.contains("first: 100"), "{q}");
+        assert!(q.contains("reviewDecision"), "{q}");
+    }
+
+    #[test]
+    fn errors_without_data_become_one_message() {
+        let body = br#"{"data":null,"errors":[{"message":"a"},{"message":"b"}]}"#;
+        assert_eq!(parse_list(body).unwrap_err().to_string(), "a; b");
+    }
+
+    #[test]
+    fn partial_data_beats_errors() {
+        let body = br#"{"data":{"search":{"nodes":[null]}},"errors":[{"message":"x"}]}"#;
+        assert!(parse_list(body).unwrap().is_empty());
+        assert!(has_data(body));
+        assert!(!has_data(br#"{"data":null,"errors":[]}"#));
+        assert!(!has_data(b"not json"));
+    }
+
+    #[test]
+    fn gh_stderr_is_flattened_to_one_line() {
+        assert_eq!(one_line("gh: first\n  second\n\n"), "first; second");
     }
 
     #[test]
     fn null_nodes_and_missing_author_are_tolerated() {
-        let body = r#"{"data":{"search":{"nodes":[null,{
+        let body = br#"{"data":{"search":{"nodes":[null,{
             "number":7,"title":"t","url":"u","isDraft":false,
             "baseRefName":"main","headRefName":"x",
             "repository":{"nameWithOwner":"o/r"},"author":null,
             "reviewDecision":"SOMETHING_NEW"}]}}}"#;
-        let prs = parse_prs(body).unwrap();
+        let prs = parse_list(body).unwrap();
         assert_eq!(prs.len(), 1);
         assert_eq!(prs[0].author, "");
         assert_eq!(prs[0].review, Review::None);
@@ -380,7 +432,7 @@ mod tests {
 
     #[test]
     fn rollup_states_map_onto_checks() {
-        let body = r#"{"data":{"search":{"nodes":[
+        let body = br#"{"data":{"search":{"nodes":[
             {"number":1,"repository":{"nameWithOwner":"o/r"},
              "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"ERROR"}}}]}},
             {"number":2,"repository":{"nameWithOwner":"o/r"},
@@ -388,14 +440,13 @@ mod tests {
             {"number":3,"repository":{"nameWithOwner":"o/r"},
              "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"EXPECTED"}}}]}}
         ]}}}"#;
-        let data: raw::Data<raw::PrChecks> = parse_response(body.as_bytes()).unwrap();
-        let checks: Vec<Checks> = data
-            .search
-            .nodes
-            .into_iter()
-            .flatten()
-            .map(|n| Checks::from(&n.commits))
-            .collect();
-        assert_eq!(checks, [Checks::Failure, Checks::None, Checks::Pending]);
+        let checks = parse_checks(body).unwrap();
+        let key = |n| PrKey {
+            repo: "o/r".into(),
+            number: n,
+        };
+        assert_eq!(checks[&key(1)], Checks::Failure);
+        assert_eq!(checks[&key(2)], Checks::None);
+        assert_eq!(checks[&key(3)], Checks::Pending);
     }
 }

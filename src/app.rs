@@ -75,6 +75,7 @@ impl MatchMode {
 }
 
 /// Only what the list shows is searchable, so every hit can be highlighted.
+#[derive(Debug)]
 struct Haystack {
     /// Fields joined by single spaces, for `Scope::All`.
     all: String,
@@ -129,6 +130,7 @@ impl Haystack {
 }
 
 /// How the query is matched, built once per refilter.
+#[derive(Debug)]
 enum Needle {
     Fuzzy(Pattern),
     // Hand-rolled: nucleo 0.3's non-ASCII substring matcher skips the last start
@@ -192,6 +194,7 @@ pub struct Highlight {
     pub author: Vec<usize>,
 }
 
+#[derive(Debug)]
 pub struct App {
     snapshot: Snapshot,
     rows: Vec<crate::stack::Row>,
@@ -210,6 +213,8 @@ pub struct App {
     generation: u64,
     error: Option<String>,
     notice: Option<Result<String, String>>,
+    /// Latest CI state per PR; lists and checks arrive in either order.
+    checks: HashMap<PrKey, Checks>,
     matcher: Matcher,
 }
 
@@ -233,6 +238,7 @@ impl App {
             generation: 0,
             error: None,
             notice: None,
+            checks: HashMap::new(),
             matcher: Matcher::new(Config::DEFAULT),
         };
         app.rebuild_rows();
@@ -265,12 +271,12 @@ impl App {
         let (Some(&row), Some(hits)) = (self.filtered.get(pos), self.hits.get(pos)) else {
             return out;
         };
-        let positions = hits.iter().map(|&i| i as usize).collect::<Vec<_>>();
+        let positions = || hits.iter().map(|&i| i as usize).collect::<Vec<_>>();
         match self.scope {
             Scope::All => return self.haystacks[row].split(hits),
-            Scope::Repo => out.repo = positions,
-            Scope::Title => out.title = positions,
-            Scope::Author => out.author = positions,
+            Scope::Repo => out.repo = positions(),
+            Scope::Title => out.title = positions(),
+            Scope::Author => out.author = positions(),
         }
         out
     }
@@ -331,16 +337,17 @@ impl App {
         generation == self.generation
     }
 
-    /// Replaces one list, carrying over known CI state until fresh checks arrive.
+    /// Replaces one list, carrying over the freshest CI state known for each PR.
     pub fn set_list(&mut self, kind: Kind, mut prs: Vec<Pr>) {
-        let known: HashMap<PrKey, Checks> = self
+        let cached: HashMap<PrKey, Checks> = self
             .snapshot
             .get(kind)
             .iter()
             .map(|p| (p.key(), p.checks))
             .collect();
         for pr in &mut prs {
-            if let Some(c) = known.get(&pr.key()) {
+            let key = pr.key();
+            if let Some(c) = self.checks.get(&key).or_else(|| cached.get(&key)) {
                 pr.checks = *c;
             }
         }
@@ -350,6 +357,8 @@ impl App {
     }
 
     pub fn set_checks(&mut self, kind: Kind, checks: &HashMap<PrKey, Checks>) {
+        self.checks
+            .extend(checks.iter().map(|(k, c)| (k.clone(), *c)));
         for pr in self.snapshot.get_mut(kind) {
             if let Some(c) = checks.get(&pr.key()) {
                 pr.checks = *c;
@@ -530,6 +539,20 @@ mod tests {
         app.set_checks(Kind::Mine, &HashMap::from([(pr(1).key(), Checks::Failure)]));
         assert_eq!(app.rows()[0].pr.checks, Checks::Failure);
         assert_eq!(app.status(), Status::Fresh);
+    }
+
+    #[test]
+    fn checks_arriving_before_the_list_are_kept() {
+        let mut app = App::new(None);
+        app.start_fetch(2);
+        app.set_checks(Kind::Mine, &HashMap::from([(pr(1).key(), Checks::Success)]));
+        app.set_list(Kind::Mine, vec![pr(1), pr(2)]);
+        assert_eq!(app.rows()[0].pr.checks, Checks::Success);
+        assert_eq!(app.rows()[1].pr.checks, Checks::None);
+        // A later refetch still remembers the CI state until new checks arrive.
+        app.start_fetch(2);
+        app.set_list(Kind::Mine, vec![pr(1)]);
+        assert_eq!(app.rows()[0].pr.checks, Checks::Success);
     }
 
     #[test]

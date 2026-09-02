@@ -178,6 +178,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
 
 const RIGHT_MARGIN: usize = 2;
 const DRAFT_PREFIX: &str = "[draft] ";
+/// Separates the review column from the author column.
+const AUTHOR_GAP: &str = " ";
 
 fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let width = (area.width as usize).saturating_sub(RIGHT_MARGIN);
@@ -207,8 +209,10 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
             let tree = format!("{indent}{branch}");
             let hl = app.highlight(pos);
             let repo = format!("{}  ", pr.short_repo());
+            // Padded by display width, not char count, so wide names keep the column.
             let author = if author_width > 0 {
-                format!(" {:<w$}", pr.author, w = author_width)
+                let pad = " ".repeat(author_width.saturating_sub(pr.author.width()));
+                format!("{AUTHOR_GAP}{}{pad}", pr.author)
             } else {
                 String::new()
             };
@@ -255,7 +259,12 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 format!(" {}", review_mark(pr.review)),
                 review_style(pr.review),
             ));
-            spans.extend(highlighted(&author, &hl.author, 1, dim()));
+            spans.extend(highlighted(
+                &author,
+                &hl.author,
+                AUTHOR_GAP.chars().count(),
+                dim(),
+            ));
             let mut line = Line::from(spans);
             if current {
                 line = line.style(Style::new().add_modifier(Modifier::BOLD));

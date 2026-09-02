@@ -13,6 +13,7 @@ Keys
   ctrl-t            cycle match type: fuzzy / substring / exact (whole field)
   tab / shift-tab   switch tab
   up / down         move (also ctrl-p / ctrl-n, ctrl-k / ctrl-j)
+  pgup / pgdn       move ten rows; ctrl-w / ctrl-u / ctrl-h delete word / query / char
   enter             open the selected PR in the browser and exit
   O (shift-o)       open the selected PR in the browser and stay
   Y (shift-y)       copy the selected PR URL to the clipboard
