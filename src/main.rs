@@ -1,6 +1,7 @@
 mod app;
 mod cache;
 mod github;
+mod mock;
 mod stack;
 mod ui;
 
@@ -50,15 +51,35 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Rows moved per PageUp/PageDown, roughly one 40% viewport.
 const PAGE_STEP: isize = 10;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataMode {
+    Live,
+    Mock,
+    Demo,
+}
+
+impl DataMode {
+    fn fixture(self) -> Option<github::Snapshot> {
+        match self {
+            DataMode::Live => None,
+            DataMode::Mock | DataMode::Demo => Some(mock::snapshot()),
+        }
+    }
+
+    fn fetches_github(self) -> bool {
+        !matches!(self, DataMode::Mock)
+    }
+}
+
 fn main() -> Result<ExitCode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args
+    let mode = match args
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>()
         .as_slice()
     {
-        [] => {}
+        [] => DataMode::Live,
         ["-h" | "--help"] => {
             print!("{}", include_str!("../HELP.txt"));
             return Ok(ExitCode::SUCCESS);
@@ -69,24 +90,35 @@ fn main() -> Result<ExitCode> {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
             return Ok(ExitCode::SUCCESS);
         }
+        ["--mock"] => DataMode::Mock,
+        ["--demo"] => DataMode::Demo,
         _ => bail!(
             "unknown arguments: {}\nSee `gh assigned --help`.",
             args.join(" ")
         ),
-    }
+    };
 
     if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         bail!("gh assigned needs an interactive terminal; use --json for scripts");
     }
 
-    let mut app = App::new(cache::load());
+    let mut app = App::new(if mode == DataMode::Live {
+        cache::load()
+    } else {
+        None
+    });
     let (tx, rx) = mpsc::channel();
-    start_fetch(&mut app, &tx);
+    if let Some(snapshot) = mode.fixture() {
+        load_fixture(&mut app, &snapshot);
+    }
+    if mode.fetches_github() {
+        start_fetch(&mut app, &tx, mode);
+    }
 
     // Drawn inline on stderr, fzf-style, so the shell scrollback stays visible.
     let height = viewport_height(app.rows().len());
     let mut terminal = enter_tui(height)?;
-    let result = run(&mut terminal, height, &mut app, &tx, &rx);
+    let result = run(&mut terminal, height, &mut app, &tx, &rx, mode);
     leave_tui(terminal)?;
 
     match result? {
@@ -182,13 +214,31 @@ struct Tagged {
     msg: Msg,
 }
 
+/// Loads fixture data without reading the cache or contacting GitHub.
+fn load_fixture(app: &mut App, snapshot: &github::Snapshot) {
+    for kind in Kind::ALL {
+        app.set_list(kind, snapshot.get(kind).to_vec());
+    }
+}
+
+fn list_for(mode: DataMode, kind: Kind) -> Result<Vec<github::Pr>> {
+    match mode {
+        DataMode::Live | DataMode::Mock => github::fetch_list(kind),
+        DataMode::Demo => {
+            let mut prs = github::fetch_demo_list(kind)?;
+            prs.append(&mut mock::list(kind));
+            Ok(prs)
+        }
+    }
+}
+
 /// Lists and CI state are independent queries, so all six run at once.
-fn start_fetch(app: &mut App, tx: &mpsc::Sender<Tagged>) {
+fn start_fetch(app: &mut App, tx: &mpsc::Sender<Tagged>, mode: DataMode) {
     let generation = app.start_fetch(Kind::ALL.len() * 2);
     for kind in Kind::ALL {
         let tx_list = tx.clone();
         std::thread::spawn(move || {
-            let msg = Msg::List(kind, github::fetch_list(kind));
+            let msg = Msg::List(kind, list_for(mode, kind));
             let _ = tx_list.send(Tagged { generation, msg });
         });
         let tx_checks = tx.clone();
@@ -205,15 +255,22 @@ fn run(
     app: &mut App,
     tx: &mpsc::Sender<Tagged>,
     rx: &mpsc::Receiver<Tagged>,
+    mode: DataMode,
 ) -> Result<Outcome> {
+    // Redraw only on input, fetch results and resizes; idle ticks just poll.
+    let mut dirty = true;
     loop {
-        terminal.draw(|f| ui::draw(f, app))?;
+        if dirty {
+            terminal.draw(|f| ui::draw(f, app))?;
+            dirty = false;
+        }
 
         let mut changed = false;
         while let Ok(Tagged { generation, msg }) = rx.try_recv() {
             if !app.accepts(generation) {
                 continue;
             }
+            dirty = true;
             match msg {
                 Msg::List(kind, Ok(prs)) => {
                     app.set_list(kind, prs);
@@ -230,7 +287,9 @@ fn run(
         }
         if changed {
             // The cache is only a warm start; failing to write it must not stop the UI.
-            let _ = cache::store(app.snapshot());
+            if mode == DataMode::Live {
+                let _ = cache::store(app.snapshot());
+            }
             if !app.help {
                 height = grow_viewport(terminal, height, viewport_height(app.rows().len()));
             }
@@ -239,13 +298,16 @@ fn run(
         if !event::poll(POLL_INTERVAL)? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let key = match event::read()? {
+            // Windows reports key releases too; only presses count.
+            Event::Key(key) if key.kind == KeyEventKind::Press => key,
+            Event::Resize(..) => {
+                dirty = true;
+                continue;
+            }
+            _ => continue,
         };
-        // Windows reports key releases too; only presses count.
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
+        dirty = true;
         app.clear_notice();
         let action = handle_key(app, key);
         if app.help {
@@ -255,7 +317,11 @@ fn run(
             Action::Continue => {}
             Action::Reload => {
                 if !app.is_fetching() {
-                    start_fetch(app, tx);
+                    if mode.fetches_github() {
+                        start_fetch(app, tx, mode);
+                    } else if let Some(snapshot) = mode.fixture() {
+                        load_fixture(app, &snapshot);
+                    }
                 }
             }
             Action::Finish(outcome) => return Ok(outcome),

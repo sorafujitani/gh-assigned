@@ -80,6 +80,13 @@ pub struct PrKey {
     pub number: u64,
 }
 
+impl PrKey {
+    /// Compares without building a key, so hot loops do not clone `repo`.
+    pub fn matches(&self, pr: &Pr) -> bool {
+        self.number == pr.number && self.repo == pr.repo
+    }
+}
+
 impl Pr {
     pub fn key(&self) -> PrKey {
         PrKey {
@@ -90,6 +97,15 @@ impl Pr {
 
     pub fn short_repo(&self) -> &str {
         self.repo.rsplit('/').next().unwrap_or(&self.repo)
+    }
+}
+
+/// Copies CI state onto the PRs it was fetched for; PRs without a result keep theirs.
+pub fn apply_checks(prs: &mut [Pr], checks: &HashMap<PrKey, Checks>) {
+    for pr in prs {
+        if let Some(c) = checks.get(&pr.key()) {
+            pr.checks = *c;
+        }
     }
 }
 
@@ -128,6 +144,18 @@ pub fn fetch_list(kind: Kind) -> Result<Vec<Pr>> {
     parse_list(&run_gh(&search_query(kind, PR_FIELDS))?)
 }
 
+/// Open PRs for the temporary demo, excluding company-owned repositories.
+pub fn fetch_demo_list(kind: Kind) -> Result<Vec<Pr>> {
+    let mut prs = fetch_list(kind)?;
+    prs.retain(|pr| !belongs_to_org(&pr.repo, "toridori-inc"));
+    Ok(prs)
+}
+
+fn belongs_to_org(repo: &str, org: &str) -> bool {
+    repo.split_once('/')
+        .is_some_and(|(owner, _)| owner.eq_ignore_ascii_case(org))
+}
+
 /// CI state for one list.
 pub fn fetch_checks(kind: Kind) -> Result<HashMap<PrKey, Checks>> {
     parse_checks(&run_gh(&search_query(kind, CHECK_FIELDS))?)
@@ -161,20 +189,31 @@ fn parse_checks(body: &[u8]) -> Result<HashMap<PrKey, Checks>> {
         .collect())
 }
 
-/// Everything at once; used by `--json`.
+/// Everything at once; used by `--json`. All six queries run in parallel, as in the TUI.
 pub fn fetch_all() -> Result<Snapshot> {
+    let fetched = std::thread::scope(|s| {
+        let handles = Kind::ALL.map(|kind| {
+            (
+                s.spawn(move || fetch_list(kind)),
+                s.spawn(move || fetch_checks(kind)),
+            )
+        });
+        handles.map(|(list, checks)| (join(list), join(checks)))
+    });
     let mut snapshot = Snapshot::default();
-    for kind in Kind::ALL {
-        let mut prs = fetch_list(kind)?;
-        let checks = fetch_checks(kind)?;
-        for pr in &mut prs {
-            if let Some(c) = checks.get(&pr.key()) {
-                pr.checks = *c;
-            }
-        }
+    for (kind, (prs, checks)) in Kind::ALL.into_iter().zip(fetched) {
+        let mut prs = prs?;
+        apply_checks(&mut prs, &checks?);
         *snapshot.get_mut(kind) = prs;
     }
     Ok(snapshot)
+}
+
+fn join<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    match handle.join() {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// Runs a query through `gh`, returning the response body when it holds usable data.
@@ -391,15 +430,31 @@ mod tests {
     }
 
     #[test]
+    fn demo_filter_matches_only_the_excluded_org_owner() {
+        assert!(belongs_to_org("toridori-inc/checkout", "toridori-inc"));
+        assert!(belongs_to_org("TORIDORI-INC/checkout", "toridori-inc"));
+        assert!(!belongs_to_org(
+            "toridori-incubator/checkout",
+            "toridori-inc"
+        ));
+        assert!(!belongs_to_org("other/toridori-inc", "toridori-inc"));
+    }
+
+    #[test]
     fn errors_without_data_become_one_message() {
         let body = br#"{"data":null,"errors":[{"message":"a"},{"message":"b"}]}"#;
-        assert_eq!(parse_list(body).unwrap_err().to_string(), "a; b");
+        assert_eq!(
+            parse_list(body)
+                .expect_err("missing GraphQL data should return the reported errors")
+                .to_string(),
+            "a; b"
+        );
     }
 
     #[test]
     fn partial_data_beats_errors() {
         let body = br#"{"data":{"search":{"nodes":[null]}},"errors":[{"message":"x"}]}"#;
-        assert!(parse_list(body).unwrap().is_empty());
+        assert!(parse_list(body).is_ok_and(|prs| prs.is_empty()));
         assert!(has_data(body));
         assert!(!has_data(br#"{"data":null,"errors":[]}"#));
         assert!(!has_data(b"not json"));
@@ -417,7 +472,12 @@ mod tests {
             "baseRefName":"main","headRefName":"x",
             "repository":{"nameWithOwner":"o/r"},"author":null,
             "reviewDecision":"SOMETHING_NEW"}]}}}"#;
-        let prs = parse_list(body).unwrap();
+        let prs = match parse_list(body) {
+            Ok(prs) => prs,
+            Err(error) => {
+                panic!("valid pull request fixture should parse: {error}");
+            }
+        };
         assert_eq!(prs.len(), 1);
         assert_eq!(prs[0].author, "");
         assert_eq!(prs[0].review, Review::None);
@@ -440,7 +500,12 @@ mod tests {
             {"number":3,"repository":{"nameWithOwner":"o/r"},
              "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"EXPECTED"}}}]}}
         ]}}}"#;
-        let checks = parse_checks(body).unwrap();
+        let checks = match parse_checks(body) {
+            Ok(checks) => checks,
+            Err(error) => {
+                panic!("valid checks fixture should parse: {error}");
+            }
+        };
         let key = |n| PrKey {
             repo: "o/r".into(),
             number: n,

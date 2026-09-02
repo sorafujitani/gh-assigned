@@ -216,13 +216,15 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 String::new()
             };
-            let right = format!(
-                " {} {}{author}",
-                checks_mark(pr.checks),
-                review_mark(pr.review)
-            );
+            let checks = format!(" {}", checks_mark(pr.checks));
+            let review = format!(" {}", review_mark(pr.review));
 
-            let used = pointer.width() + tree.width() + repo.width() + right.width();
+            let used = pointer.width()
+                + tree.width()
+                + repo.width()
+                + checks.width()
+                + review.width()
+                + author.width();
             let title_width = width.saturating_sub(used);
             let full_title = if pr.is_draft {
                 format!("{DRAFT_PREFIX}{}", pr.title)
@@ -251,14 +253,8 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 .collect();
             spans.extend(highlighted(&title, &title_hits, 0, title_style));
             spans.push(Span::raw(pad));
-            spans.push(Span::styled(
-                format!(" {}", checks_mark(pr.checks)),
-                checks_style(pr.checks),
-            ));
-            spans.push(Span::styled(
-                format!(" {}", review_mark(pr.review)),
-                review_style(pr.review),
-            ));
+            spans.push(Span::styled(checks, checks_style(pr.checks)));
+            spans.push(Span::styled(review, review_style(pr.review)));
             spans.extend(highlighted(
                 &author,
                 &hl.author,
@@ -337,6 +333,7 @@ mod tests {
     use crate::github::{Pr, Snapshot};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
 
     fn pr(n: u64, base: &str, head: &str, title: &str) -> Pr {
         Pr {
@@ -353,10 +350,13 @@ mod tests {
         }
     }
 
-    fn render(app: &mut App, width: u16) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+    fn render_buffer(app: &mut App, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| draw(f, app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
+        terminal.backend().buffer().clone()
+    }
+
+    fn text(buf: &Buffer) -> String {
         (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
@@ -365,6 +365,18 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn render(app: &mut App, width: u16) -> String {
+        text(&render_buffer(app, width, 12))
+    }
+
+    /// The symbols on `row` drawn with the hit background.
+    fn marked(buf: &Buffer, row: u16) -> String {
+        (0..buf.area.width)
+            .filter(|&x| buf[(x, row)].bg == HIT_BG)
+            .map(|x| buf[(x, row)].symbol().to_string())
+            .collect()
     }
 
     fn stacked() -> Snapshot {
@@ -434,32 +446,14 @@ mod tests {
         for c in "unrel".chars() {
             app.push_char(c);
         }
-        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let buf = terminal.backend().buffer();
-        let row = 2;
-        let marked: String = (0..buf.area.width)
-            .filter(|&x| buf[(x, row)].bg == HIT_BG)
-            .map(|x| buf[(x, row)].symbol().to_string())
-            .collect();
-        assert_eq!(marked, "unrel");
+        assert_eq!(marked(&render_buffer(&mut app, 80, 12), 2), "unrel");
     }
 
     #[test]
     fn help_overlay_lists_keys_and_hides_the_list() {
         let mut app = App::new(Some(stacked()));
         app.help = true;
-        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let out: String = (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let out = text(&render_buffer(&mut app, 80, 20));
         assert!(out.contains("esc to close"), "{out}");
         assert!(!out.contains("some keys hidden"), "{out}");
         assert!(out.contains("esc / ctrl-c"), "{out}");
@@ -497,29 +491,16 @@ mod tests {
         for c in "login".chars() {
             app.push_char(c);
         }
-        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let buf = terminal.backend().buffer();
-        let marked: String = (0..buf.area.width)
-            .filter(|&x| buf[(x, 2)].bg == HIT_BG)
-            .map(|x| buf[(x, 2)].symbol().to_string())
-            .collect();
-        assert_eq!(marked, "login");
+        assert_eq!(marked(&render_buffer(&mut app, 80, 12), 2), "login");
     }
 
     #[test]
     fn short_help_viewport_uses_columns() {
         let mut app = App::new(Some(stacked()));
         app.help = true;
-        let mut terminal = Terminal::new(TestBackend::new(160, 8)).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let out: Vec<String> = (0..buf.area.height)
-            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
-            .collect();
-        let text = out.join("\n");
-        assert!(text.contains("esc / ctrl-c"), "{text}");
-        assert!(text.contains("ctrl-r"), "{text}");
+        let out = text(&render_buffer(&mut app, 160, 8));
+        assert!(out.contains("esc / ctrl-c"), "{out}");
+        assert!(out.contains("ctrl-r"), "{out}");
     }
 
     #[test]

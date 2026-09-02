@@ -82,6 +82,9 @@ struct Haystack {
     repo: String,
     title: String,
     author: Option<String>,
+    /// Char offsets of `title` and `author` within `all`.
+    title_start: usize,
+    author_start: usize,
 }
 
 impl Haystack {
@@ -93,11 +96,15 @@ impl Haystack {
             all.push(' ');
             all.push_str(a);
         }
+        let title_start = repo.chars().count() + 1;
+        let author_start = title_start + pr.title.chars().count() + 1;
         Haystack {
             all,
             repo,
             title: pr.title.clone(),
             author,
+            title_start,
+            author_start,
         }
     }
 
@@ -113,8 +120,11 @@ impl Haystack {
     /// Split hit positions in `all` back into per-field positions.
     fn split(&self, hits: &[u32]) -> Highlight {
         let mut out = Highlight::default();
-        let title_start = self.repo.chars().count() + 1;
-        let author_start = title_start + self.title.chars().count() + 1;
+        let Haystack {
+            title_start,
+            author_start,
+            ..
+        } = *self;
         for &i in hits {
             let i = i as usize;
             if i < title_start - 1 {
@@ -148,6 +158,12 @@ fn fold(c: char) -> char {
     c.to_lowercase().next().unwrap_or(c)
 }
 
+fn fold_in_place(hay: &mut [char]) {
+    for c in hay {
+        *c = fold(*c);
+    }
+}
+
 impl Needle {
     fn new(query: &str, mode: MatchMode) -> Self {
         let folded = || query.chars().map(fold).collect();
@@ -164,19 +180,33 @@ impl Needle {
     }
 
     /// Fills `hits` with char positions and returns a score (higher sorts first).
-    fn indices(&self, hay: &[char], matcher: &mut Matcher, hits: &mut Vec<u32>) -> Option<u32> {
+    /// Case-folds `hay` in place for the verbatim modes; nucleo folds on its own.
+    fn indices_in_place(
+        &self,
+        hay: &mut [char],
+        matcher: &mut Matcher,
+        hits: &mut Vec<u32>,
+    ) -> Option<u32> {
         match self {
             Needle::Fuzzy(p) => p.indices(Utf32Str::Unicode(hay), matcher, hits),
             Needle::Substring(needle) => {
+                if needle.len() > hay.len() {
+                    return None;
+                }
+                fold_in_place(hay);
                 let start = hay
                     .windows(needle.len())
-                    .position(|w| w.iter().map(|&c| fold(c)).eq(needle.iter().copied()))?;
+                    .position(|w| w == needle.as_slice())?;
                 hits.extend((start..start + needle.len()).map(idx));
                 // Earlier matches rank higher, as in fzf.
                 Some(u32::MAX - idx(start))
             }
             Needle::Exact(needle) => {
-                if !hay.iter().map(|&c| fold(c)).eq(needle.iter().copied()) {
+                if needle.len() != hay.len() {
+                    return None;
+                }
+                fold_in_place(hay);
+                if hay != needle.as_slice() {
                     return None;
                 }
                 hits.extend((0..hay.len()).map(idx));
@@ -359,11 +389,7 @@ impl App {
     pub fn set_checks(&mut self, kind: Kind, checks: &HashMap<PrKey, Checks>) {
         self.checks
             .extend(checks.iter().map(|(k, c)| (k.clone(), *c)));
-        for pr in self.snapshot.get_mut(kind) {
-            if let Some(c) = checks.get(&pr.key()) {
-                pr.checks = *c;
-            }
-        }
+        crate::github::apply_checks(self.snapshot.get_mut(kind), checks);
         self.finish_step(kind);
     }
 
@@ -461,7 +487,7 @@ impl App {
                     // highlighter counts chars, so feed nucleo chars explicitly.
                     buf.clear();
                     buf.extend(h.text(self.scope)?.chars());
-                    let score = needle.indices(&buf, &mut self.matcher, &mut hits)?;
+                    let score = needle.indices_in_place(&mut buf, &mut self.matcher, &mut hits)?;
                     hits.sort_unstable();
                     hits.dedup();
                     Some((score, i, hits))
@@ -475,7 +501,7 @@ impl App {
             .and_then(|key| {
                 self.filtered
                     .iter()
-                    .position(|&i| self.rows[i].pr.key() == key)
+                    .position(|&i| key.matches(&self.rows[i].pr))
             })
             .unwrap_or(0);
         self.list_state.select(Some(cursor));
