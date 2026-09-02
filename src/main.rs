@@ -17,12 +17,36 @@ use std::process::{Command, ExitCode};
 use std::sync::mpsc;
 use std::time::Duration;
 
+/// What one key press asks the event loop to do.
 enum Action {
     Continue,
     Reload,
-    Quit,
+    Finish(Outcome),
+}
+
+/// How the interactive session ended.
+enum Outcome {
+    Cancel,
     Open(String),
 }
+
+/// Same as fzf: cancelling exits with a code scripts can tell from success.
+const EXIT_CANCELLED: u8 = 130;
+
+/// Fallback when the terminal size is unknown; the classic VT100 height.
+const FALLBACK_TERM_ROWS: u16 = 24;
+
+/// Prompt and info line above the list.
+const HEADER_ROWS: u16 = 2;
+
+/// Enough for the header plus a few rows so an empty list is still recognisable.
+const MIN_HEIGHT: u16 = 8;
+
+/// Keeps drawing responsive to fetch results without busy-looping.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Rows moved per PageUp/PageDown, roughly one 40% viewport.
+const PAGE_STEP: isize = 10;
 
 fn main() -> Result<ExitCode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -58,37 +82,45 @@ fn main() -> Result<ExitCode> {
     start_fetch(&mut app, &tx);
 
     // Drawn inline on stderr, fzf-style, so the shell scrollback stays visible.
-    let mut terminal = enter_tui(app.rows().len())?;
-    let result = run(&mut terminal, &mut app, &tx, &rx);
+    let height = viewport_height(app.rows().len());
+    let mut terminal = enter_tui(height)?;
+    let result = run(&mut terminal, height, &mut app, &tx, &rx);
     leave_tui(terminal)?;
 
     match result? {
-        Action::Open(url) => {
+        Outcome::Open(url) => {
             open_in_browser(&url);
             Ok(ExitCode::SUCCESS)
         }
-        // Same as fzf: cancelling exits with a distinct code.
-        _ => Ok(ExitCode::from(130)),
+        Outcome::Cancel => Ok(ExitCode::from(EXIT_CANCELLED)),
     }
 }
 
 type Tui = Terminal<CrosstermBackend<io::Stderr>>;
 
-const MIN_HEIGHT: u16 = 8;
+fn term_rows() -> u16 {
+    size().map_or(FALLBACK_TERM_ROWS, |(_, h)| h)
+}
 
-/// Like fzf's `--height 40%`, capped by the visible list plus the two header rows.
+fn rows_as_u16(rows: usize) -> u16 {
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+/// Like fzf's `--height 40%`, capped by the visible list plus the header rows.
 fn viewport_height(rows: usize) -> u16 {
-    let term_rows = size().map(|(_, h)| h).unwrap_or(24);
-    let wanted = (rows as u16).saturating_add(2).max(MIN_HEIGHT);
-    wanted
-        .min((term_rows * 2 / 5).max(MIN_HEIGHT))
-        .min(term_rows)
+    let term_rows = term_rows();
+    let wanted = rows_as_u16(rows)
+        .saturating_add(HEADER_ROWS)
+        .max(MIN_HEIGHT);
+    let forty_percent = term_rows.saturating_mul(2) / 5;
+    wanted.min(forty_percent.max(MIN_HEIGHT)).min(term_rows)
 }
 
 /// The help overlay needs more rows than the list usually gets.
 fn help_viewport_height() -> u16 {
-    let term_rows = size().map(|(_, h)| h).unwrap_or(24);
-    (ui::help_rows() as u16).saturating_add(1).min(term_rows)
+    rows_as_u16(ui::help_rows())
+        .saturating_add(1)
+        .min(term_rows())
 }
 
 fn inline_terminal(height: u16) -> Result<Tui> {
@@ -101,21 +133,31 @@ fn inline_terminal(height: u16) -> Result<Tui> {
     )?)
 }
 
-fn enter_tui(rows: usize) -> Result<Tui> {
+fn enter_tui(height: u16) -> Result<Tui> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         default_hook(info);
     }));
     enable_raw_mode()?;
-    inline_terminal(viewport_height(rows))
+    inline_terminal(height)
 }
 
 /// An inline viewport cannot grow in place, so swap in a new one at the same spot.
-fn resize_viewport(terminal: &mut Tui, height: u16) -> Result<()> {
+/// Only grows: shrinking again would re-anchor above the rows the taller one used.
+/// Returns the height actually in effect; a failed swap keeps the old terminal.
+fn grow_viewport(terminal: &mut Tui, current: u16, wanted: u16) -> u16 {
+    if wanted <= current {
+        return current;
+    }
     let _ = terminal.clear();
-    *terminal = inline_terminal(height)?;
-    Ok(())
+    match inline_terminal(wanted) {
+        Ok(t) => {
+            *terminal = t;
+            wanted
+        }
+        Err(_) => current,
+    }
 }
 
 fn leave_tui(mut terminal: Tui) -> Result<()> {
@@ -155,10 +197,11 @@ fn start_fetch(app: &mut App, tx: &mpsc::Sender<Tagged>) {
 
 fn run(
     terminal: &mut Tui,
+    mut height: u16,
     app: &mut App,
     tx: &mpsc::Sender<Tagged>,
     rx: &mpsc::Receiver<Tagged>,
-) -> Result<Action> {
+) -> Result<Outcome> {
     loop {
         terminal.draw(|f| ui::draw(f, app))?;
 
@@ -173,19 +216,20 @@ fn run(
                     changed = true;
                 }
                 Msg::Checks(kind, Ok(checks)) => {
-                    app.set_checks(kind, checks);
+                    app.set_checks(kind, &checks);
                     changed = true;
                 }
                 Msg::List(kind, Err(e)) | Msg::Checks(kind, Err(e)) => {
-                    app.set_error(kind, e.to_string())
+                    app.set_error(kind, &e.to_string());
                 }
             }
         }
         if changed {
+            // The cache is only a warm start; failing to write it must not stop the UI.
             let _ = cache::store(app.snapshot());
         }
 
-        if !event::poll(Duration::from_millis(100))? {
+        if !event::poll(POLL_INTERVAL)? {
             continue;
         }
         let Event::Key(key) = event::read()? else {
@@ -196,15 +240,9 @@ fn run(
             continue;
         }
         app.clear_notice();
-        let help_was_open = app.help;
         let action = handle_key(app, key);
-        if app.help != help_was_open {
-            let height = if app.help {
-                help_viewport_height()
-            } else {
-                viewport_height(app.rows().len())
-            };
-            resize_viewport(terminal, height)?;
+        if app.help {
+            height = grow_viewport(terminal, height, help_viewport_height());
         }
         match action {
             Action::Continue => {}
@@ -213,8 +251,7 @@ fn run(
                     start_fetch(app, tx);
                 }
             }
-            Action::Quit => return Ok(Action::Quit),
-            Action::Open(url) => return Ok(Action::Open(url)),
+            Action::Finish(outcome) => return Ok(outcome),
         }
     }
 }
@@ -222,7 +259,13 @@ fn run(
 fn handle_key(app: &mut App, key: KeyEvent) -> Action {
     if app.help {
         app.help = false;
-        return Action::Continue;
+        // Dismiss keys stop here; anything else also acts normally so typing is not eaten.
+        if matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::F(1) | KeyCode::Char('?')
+        ) {
+            return Action::Continue;
+        }
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let plain = !key
@@ -233,18 +276,15 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
             app.help = true;
             Action::Continue
         }
-        // `?` only opens help on an empty prompt so it can still be typed mid-query.
-        // cmd-? is accepted too, though most terminals never forward it.
-        KeyCode::Char('?')
-            if app.query.is_empty() || key.modifiers.contains(KeyModifiers::SUPER) =>
-        {
+        // Only on an empty prompt so `?` can still be typed mid-query.
+        KeyCode::Char('?') if plain && app.query.is_empty() => {
             app.help = true;
             Action::Continue
         }
-        KeyCode::Esc => Action::Quit,
-        KeyCode::Char('c' | 'q') if ctrl => Action::Quit,
+        KeyCode::Esc => Action::Finish(Outcome::Cancel),
+        KeyCode::Char('c' | 'q') if ctrl => Action::Finish(Outcome::Cancel),
         KeyCode::Enter => match app.selected() {
-            Some(row) => Action::Open(row.pr.url.clone()),
+            Some(row) => Action::Finish(Outcome::Open(row.pr.url.clone())),
             None => Action::Continue,
         },
         // Open without leaving, for going through several PRs.
@@ -268,68 +308,33 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
             }
             Action::Continue
         }
-        KeyCode::Tab | KeyCode::Right => {
-            app.next_tab();
-            Action::Continue
-        }
-        KeyCode::BackTab | KeyCode::Left => {
-            app.prev_tab();
-            Action::Continue
-        }
-        KeyCode::Down => {
-            app.move_cursor(1);
-            Action::Continue
-        }
-        KeyCode::Char('n' | 'j') if ctrl => {
-            app.move_cursor(1);
-            Action::Continue
-        }
-        KeyCode::Up => {
-            app.move_cursor(-1);
-            Action::Continue
-        }
-        KeyCode::Char('p' | 'k') if ctrl => {
-            app.move_cursor(-1);
-            Action::Continue
-        }
-        KeyCode::PageDown => {
-            app.move_cursor(10);
-            Action::Continue
-        }
-        KeyCode::PageUp => {
-            app.move_cursor(-10);
-            Action::Continue
-        }
-        KeyCode::Backspace => {
-            app.pop_char();
-            Action::Continue
-        }
-        KeyCode::Char('h') if ctrl => {
-            app.pop_char();
-            Action::Continue
-        }
-        KeyCode::Char('w') if ctrl => {
-            app.pop_word();
-            Action::Continue
-        }
-        KeyCode::Char('u') if ctrl => {
-            app.clear_query();
-            Action::Continue
-        }
         KeyCode::Char('r') if ctrl => Action::Reload,
-        KeyCode::Char('f') if ctrl => {
-            app.next_scope();
+        _ => {
+            edit_or_move(app, key, ctrl, plain);
             Action::Continue
         }
-        KeyCode::Char('t') if ctrl => {
-            app.next_mode();
-            Action::Continue
-        }
-        KeyCode::Char(c) if plain => {
-            app.push_char(c);
-            Action::Continue
-        }
-        _ => Action::Continue,
+    }
+}
+
+/// Keys that only change what is shown: tabs, cursor, query, scope and mode.
+fn edit_or_move(app: &mut App, key: KeyEvent, ctrl: bool, plain: bool) {
+    match key.code {
+        KeyCode::Tab | KeyCode::Right => app.next_tab(),
+        KeyCode::BackTab | KeyCode::Left => app.prev_tab(),
+        KeyCode::Down => app.move_cursor(1),
+        KeyCode::Char('n' | 'j') if ctrl => app.move_cursor(1),
+        KeyCode::Up => app.move_cursor(-1),
+        KeyCode::Char('p' | 'k') if ctrl => app.move_cursor(-1),
+        KeyCode::PageDown => app.move_cursor(PAGE_STEP),
+        KeyCode::PageUp => app.move_cursor(-PAGE_STEP),
+        KeyCode::Backspace => app.pop_char(),
+        KeyCode::Char('h') if ctrl => app.pop_char(),
+        KeyCode::Char('w') if ctrl => app.pop_word(),
+        KeyCode::Char('u') if ctrl => app.clear_query(),
+        KeyCode::Char('f') if ctrl => app.next_scope(),
+        KeyCode::Char('t') if ctrl => app.next_mode(),
+        KeyCode::Char(c) if plain => app.push_char(c),
+        _ => {}
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::app::{App, Highlight, Status};
+use crate::app::{App, MatchMode, Scope, Status};
 use crate::github::{Checks, Kind, Review};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -17,11 +17,13 @@ fn dim() -> Style {
     Style::new().add_modifier(Modifier::DIM)
 }
 
-// A fixed 256-color grey: ANSI DarkGray is theme-mapped and vanishes on dark themes.
+// Fixed 256-color grey with a light foreground: ANSI DarkGray is theme-mapped and
+// vanishes on dark themes, and a bare grey background swallows black text on light ones.
 const HIT_BG: Color = Color::Indexed(238);
+const HIT_FG: Color = Color::Indexed(255);
 
 fn hit() -> Style {
-    Style::new().bg(HIT_BG)
+    Style::new().bg(HIT_BG).fg(HIT_FG)
 }
 
 /// Split `text` into spans, giving the chars at `hits` (shifted by `offset`) the hit background.
@@ -30,7 +32,11 @@ fn highlighted(text: &str, hits: &[usize], offset: usize, base: Style) -> Vec<Sp
     let mut run = String::new();
     let mut run_hit = false;
     for (i, c) in text.chars().enumerate() {
-        let is_hit = i >= offset && hits.contains(&(i - offset));
+        let mut is_hit = i >= offset && hits.contains(&(i - offset));
+        // Combining marks and variation selectors must stay with their base char.
+        if unicode_width::UnicodeWidthChar::width(c) == Some(0) && !run.is_empty() {
+            is_hit = run_hit;
+        }
         if is_hit != run_hit && !run.is_empty() {
             spans.push(Span::styled(
                 std::mem::take(&mut run),
@@ -61,22 +67,30 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(prompt_line(app), prompt);
     if app.help {
         draw_help(frame, info.union(list));
-    } else {
-        frame.render_widget(info_line(app), info);
-        draw_list(frame, app, list);
+        return;
     }
-    let cursor_x = mode_label(app).width() + 2 + app.query.width();
-    frame.set_cursor_position((prompt.x + cursor_x as u16, prompt.y));
+    frame.render_widget(info_line(app), info);
+    draw_list(frame, app, list);
+    let cursor_x = mode_label(app).width() + PROMPT.width() + app.query.width();
+    let cursor_x = u16::try_from(cursor_x).unwrap_or(u16::MAX);
+    frame.set_cursor_position((prompt.x.saturating_add(cursor_x), prompt.y));
 }
 
+/// Shown only when the search differs from the default all·fuzzy.
+const PROMPT: &str = "> ";
+
 fn mode_label(app: &App) -> String {
-    format!("{}·{} ", app.scope.label(), app.mode.label())
+    if app.scope == Scope::All && app.mode == MatchMode::Fuzzy {
+        String::new()
+    } else {
+        format!("{}·{} ", app.scope.label(), app.mode.label())
+    }
 }
 
 fn prompt_line(app: &App) -> Paragraph<'static> {
     Paragraph::new(Line::from(vec![
         Span::styled(mode_label(app), dim()),
-        Span::styled("> ", accent()),
+        Span::styled(PROMPT, accent()),
         Span::raw(app.query.clone()),
     ]))
 }
@@ -132,13 +146,34 @@ pub fn help_rows() -> usize {
     help_keys().count() + 1
 }
 
+/// Falls back to side-by-side columns when the viewport is shorter than the key list.
 fn draw_help(frame: &mut Frame, area: Rect) {
+    let keys: Vec<Line> = help_keys().map(Line::raw).collect();
+    let rows = (area.height as usize).max(1);
+    let widest = help_keys().map(UnicodeWidthStr::width).max().unwrap_or(0);
+    let col_width = u16::try_from(widest).unwrap_or(u16::MAX).saturating_add(3);
+    let columns_that_fit = (area.width / col_width.max(1)).max(1) as usize;
+    let shown = (rows.saturating_sub(1) + rows * (columns_that_fit - 1)).min(keys.len());
+    let hint = if shown < keys.len() {
+        "   esc to close · terminal too small, some keys hidden"
+    } else {
+        "   esc to close"
+    };
     let mut lines = vec![Line::from(vec![
         Span::styled("  keys", accent().add_modifier(Modifier::BOLD)),
-        Span::styled("   any key to close", dim()),
+        Span::styled(hint, dim()),
     ])];
-    lines.extend(help_keys().map(Line::raw));
-    frame.render_widget(Paragraph::new(lines), area);
+    lines.extend(keys);
+    let mut x = area.x;
+    for column in lines.chunks(rows) {
+        if x >= area.right() {
+            break;
+        }
+        let width = col_width.min(area.right() - x);
+        let col = Rect::new(x, area.y, width, area.height);
+        frame.render_widget(Paragraph::new(column.to_vec()), col);
+        x += col_width;
+    }
 }
 
 const RIGHT_MARGIN: usize = 2;
@@ -170,7 +205,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
             let indent = "  ".repeat(row.depth);
             let branch = if row.depth > 0 { "└ " } else { "" };
             let tree = format!("{indent}{branch}");
-            let hl: Highlight = app.highlight(pos);
+            let hl = app.highlight(pos);
             let repo = format!("{}  ", pr.short_repo());
             let author = if author_width > 0 {
                 format!(" {:<w$}", pr.author, w = author_width)
@@ -180,7 +215,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
             let right = format!(
                 " {} {}{author}",
                 checks_mark(pr.checks),
-                review_mark(&pr.review)
+                review_mark(pr.review)
             );
 
             let used = pointer.width() + tree.width() + repo.width() + right.width();
@@ -200,7 +235,10 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
             ];
             spans.extend(highlighted(&repo, &hl.repo, 0, Style::new()));
             // Hits past the truncation point would land on the ellipsis.
-            let kept = title.chars().count() - usize::from(title != full_title);
+            let kept = title
+                .chars()
+                .count()
+                .saturating_sub(usize::from(title != full_title));
             let title_hits: Vec<usize> = hl
                 .title
                 .iter()
@@ -214,8 +252,8 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 checks_style(pr.checks),
             ));
             spans.push(Span::styled(
-                format!(" {}", review_mark(&pr.review)),
-                review_style(&pr.review),
+                format!(" {}", review_mark(pr.review)),
+                review_style(pr.review),
             ));
             spans.extend(highlighted(&author, &hl.author, 1, dim()));
             let mut line = Line::from(spans);
@@ -266,7 +304,7 @@ fn checks_style(c: Checks) -> Style {
     }
 }
 
-fn review_mark(r: &Review) -> &'static str {
+fn review_mark(r: Review) -> &'static str {
     match r {
         Review::Approved => "approved",
         Review::ChangesRequested => "changes ",
@@ -275,7 +313,7 @@ fn review_mark(r: &Review) -> &'static str {
     }
 }
 
-fn review_style(r: &Review) -> Style {
+fn review_style(r: Review) -> Style {
     match r {
         Review::Approved => accent(),
         Review::ChangesRequested => Style::new().fg(Color::Red),
@@ -335,7 +373,6 @@ mod tests {
         let mut app = App::new(Some(stacked()));
         let out = render(&mut app, 80);
         assert!(out.contains("3/3"));
-        assert!(out.contains("all·fuzzy > "), "{out}");
         assert!(out.contains("▌ r  first"));
         assert!(out.contains("  └ r  [draft] second"));
         assert!(!out.contains(" me"), "author is hidden on Mine");
@@ -344,11 +381,14 @@ mod tests {
             app.push_char(c);
         }
         let out = render(&mut app, 80);
-        assert!(out.contains("all·fuzzy > unrel"), "{out}");
+        assert!(out.contains("> unrel"), "{out}");
+        assert!(!out.contains("all·fuzzy"), "default mode is not labelled");
         assert!(out.contains("1/3"));
         assert!(out.contains("r  unrelated"));
         assert!(!out.contains("first"));
         assert_eq!(app.selected().unwrap().pr.number, 3);
+        app.next_scope();
+        assert!(render(&mut app, 80).contains("repo·fuzzy > unrel"));
     }
 
     #[test]
@@ -400,10 +440,25 @@ mod tests {
     fn help_overlay_lists_keys_and_hides_the_list() {
         let mut app = App::new(Some(stacked()));
         app.help = true;
-        let out = render(&mut app, 80);
-        assert!(out.contains("any key to close"), "{out}");
-        assert!(out.contains("ctrl-r"), "{out}");
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let out: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(out.contains("esc to close"), "{out}");
+        assert!(!out.contains("some keys hidden"), "{out}");
+        assert!(out.contains("esc / ctrl-c"), "{out}");
         assert!(!out.contains("first"), "{out}");
+
+        // Too short and too narrow for columns: say so instead of silently truncating.
+        let out = render(&mut app, 80);
+        assert!(out.contains("some keys hidden"), "{out}");
     }
 
     #[test]
@@ -411,8 +466,51 @@ mod tests {
         let mut snapshot = Snapshot::default();
         *snapshot.get_mut(Kind::Mine) =
             vec![pr(1, "main", "a", "a very long title that will not fit")];
+        let mut long = pr(2, "main", "b", "second");
+        long.author = "dependabot[bot]".into();
+        long.repo = "org/my-service".into();
+        *snapshot.get_mut(Kind::ReviewRequested) = vec![long];
         let mut app = App::new(Some(snapshot));
-        render(&mut app, 20);
+        for width in [40, 20, 10, 1] {
+            render(&mut app, width);
+        }
+        app.next_tab();
+        for width in [40, 20, 10, 1] {
+            render(&mut app, width);
+        }
+    }
+
+    #[test]
+    fn highlight_stays_on_the_chars_after_an_emoji() {
+        let mut snapshot = Snapshot::default();
+        *snapshot.get_mut(Kind::Mine) = vec![pr(1, "main", "a", "❤\u{fe0f} fix login")];
+        let mut app = App::new(Some(snapshot));
+        for c in "login".chars() {
+            app.push_char(c);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let marked: String = (0..buf.area.width)
+            .filter(|&x| buf[(x, 2)].bg == HIT_BG)
+            .map(|x| buf[(x, 2)].symbol().to_string())
+            .collect();
+        assert_eq!(marked, "login");
+    }
+
+    #[test]
+    fn short_help_viewport_uses_columns() {
+        let mut app = App::new(Some(stacked()));
+        app.help = true;
+        let mut terminal = Terminal::new(TestBackend::new(160, 8)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let out: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let text = out.join("\n");
+        assert!(text.contains("esc / ctrl-c"), "{text}");
+        assert!(text.contains("ctrl-r"), "{text}");
     }
 
     #[test]

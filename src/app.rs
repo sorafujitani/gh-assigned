@@ -1,5 +1,5 @@
 use crate::github::{Checks, Kind, Pr, PrKey, Snapshot};
-use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization, Pattern};
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::widgets::ListState;
 use std::collections::HashMap;
@@ -131,31 +131,55 @@ impl Haystack {
 /// How the query is matched, built once per refilter.
 enum Needle {
     Fuzzy(Pattern),
-    Whole(Atom),
+    // Hand-rolled: nucleo 0.3's non-ASCII substring matcher skips the last start
+    // position, so anything ending at the end of a field never matches.
+    Substring(Vec<char>),
+    Exact(Vec<char>),
+}
+
+fn idx(i: usize) -> u32 {
+    u32::try_from(i).unwrap_or(u32::MAX)
+}
+
+fn fold(c: char) -> char {
+    // One char per char keeps hit indices aligned with the haystack.
+    c.to_lowercase().next().unwrap_or(c)
 }
 
 impl Needle {
     fn new(query: &str, mode: MatchMode) -> Self {
-        let (case, norm) = (CaseMatching::Ignore, Normalization::Smart);
+        let folded = || query.chars().map(fold).collect();
         match mode {
-            MatchMode::Fuzzy => Needle::Fuzzy(Pattern::parse(query, case, norm)),
+            MatchMode::Fuzzy => Needle::Fuzzy(Pattern::parse(
+                query,
+                CaseMatching::Ignore,
+                Normalization::Smart,
+            )),
             // Substring and exact take the query verbatim, spaces included.
-            MatchMode::Substring => {
-                Needle::Whole(Atom::new(query, case, norm, AtomKind::Substring, false))
-            }
-            MatchMode::Exact => Needle::Whole(Atom::new(query, case, norm, AtomKind::Exact, false)),
+            MatchMode::Substring => Needle::Substring(folded()),
+            MatchMode::Exact => Needle::Exact(folded()),
         }
     }
 
-    fn indices(
-        &self,
-        hay: Utf32Str<'_>,
-        matcher: &mut Matcher,
-        hits: &mut Vec<u32>,
-    ) -> Option<u32> {
+    /// Fills `hits` with char positions and returns a score (higher sorts first).
+    fn indices(&self, hay: &[char], matcher: &mut Matcher, hits: &mut Vec<u32>) -> Option<u32> {
         match self {
-            Needle::Fuzzy(p) => p.indices(hay, matcher, hits),
-            Needle::Whole(a) => a.indices(hay, matcher, hits).map(u32::from),
+            Needle::Fuzzy(p) => p.indices(Utf32Str::Unicode(hay), matcher, hits),
+            Needle::Substring(needle) => {
+                let start = hay
+                    .windows(needle.len())
+                    .position(|w| w.iter().map(|&c| fold(c)).eq(needle.iter().copied()))?;
+                hits.extend((start..start + needle.len()).map(idx));
+                // Earlier matches rank higher, as in fzf.
+                Some(u32::MAX - idx(start))
+            }
+            Needle::Exact(needle) => {
+                if !hay.iter().map(|&c| fold(c)).eq(needle.iter().copied()) {
+                    return None;
+                }
+                hits.extend((0..hay.len()).map(idx));
+                Some(0)
+            }
         }
     }
 }
@@ -173,7 +197,7 @@ pub struct App {
     rows: Vec<crate::stack::Row>,
     haystacks: Vec<Haystack>,
     pub filtered: Vec<usize>,
-    /// Parallel to `filtered`: char indices into the row's haystack.
+    /// Parallel to `filtered`: char indices into the scoped field(s) of the row.
     hits: Vec<Vec<u32>>,
     pub tab: Kind,
     pub query: String,
@@ -241,7 +265,7 @@ impl App {
         let (Some(&row), Some(hits)) = (self.filtered.get(pos), self.hits.get(pos)) else {
             return out;
         };
-        let positions = hits.iter().map(|&i| i as usize).collect();
+        let positions = hits.iter().map(|&i| i as usize).collect::<Vec<_>>();
         match self.scope {
             Scope::All => return self.haystacks[row].split(hits),
             Scope::Repo => out.repo = positions,
@@ -325,7 +349,7 @@ impl App {
         self.finish_step(kind);
     }
 
-    pub fn set_checks(&mut self, kind: Kind, checks: HashMap<PrKey, Checks>) {
+    pub fn set_checks(&mut self, kind: Kind, checks: &HashMap<PrKey, Checks>) {
         for pr in self.snapshot.get_mut(kind) {
             if let Some(c) = checks.get(&pr.key()) {
                 pr.checks = *c;
@@ -334,7 +358,7 @@ impl App {
         self.finish_step(kind);
     }
 
-    pub fn set_error(&mut self, kind: Kind, message: String) {
+    pub fn set_error(&mut self, kind: Kind, message: &str) {
         self.error = Some(format!("{}: {message}", kind.label()));
         self.pending = self.pending.saturating_sub(1);
     }
@@ -361,8 +385,8 @@ impl App {
             self.list_state.select(Some(0));
             return;
         }
-        let max = self.filtered.len() as isize - 1;
-        let next = (self.cursor() as isize + delta).clamp(0, max) as usize;
+        let last = self.filtered.len() - 1;
+        let next = self.cursor().saturating_add_signed(delta).min(last);
         self.list_state.select(Some(next));
     }
 
@@ -378,7 +402,7 @@ impl App {
 
     pub fn pop_word(&mut self) {
         let trimmed = self.query.trim_end();
-        let cut = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
+        let cut = trimmed.rfind(' ').map_or(0, |i| i + 1);
         self.query.truncate(cut);
         self.refilter();
     }
@@ -424,11 +448,11 @@ impl App {
                 .enumerate()
                 .filter_map(|(i, h)| {
                     let mut hits = Vec::new();
-                    let score = needle.indices(
-                        Utf32Str::new(h.text(self.scope)?, &mut buf),
-                        &mut self.matcher,
-                        &mut hits,
-                    )?;
+                    // `Utf32Str::new` indexes by grapheme (or byte for ASCII); the
+                    // highlighter counts chars, so feed nucleo chars explicitly.
+                    buf.clear();
+                    buf.extend(h.text(self.scope)?.chars());
+                    let score = needle.indices(&buf, &mut self.matcher, &mut hits)?;
                     hits.sort_unstable();
                     hits.dedup();
                     Some((score, i, hits))
@@ -503,7 +527,7 @@ mod tests {
         app.start_fetch(2);
         app.set_list(Kind::Mine, vec![pr(1)]);
         assert_eq!(app.rows()[0].pr.checks, Checks::Success);
-        app.set_checks(Kind::Mine, HashMap::from([(pr(1).key(), Checks::Failure)]));
+        app.set_checks(Kind::Mine, &HashMap::from([(pr(1).key(), Checks::Failure)]));
         assert_eq!(app.rows()[0].pr.checks, Checks::Failure);
         assert_eq!(app.status(), Status::Fresh);
     }
@@ -512,7 +536,7 @@ mod tests {
     fn error_is_reported_after_all_steps_finish() {
         let mut app = App::new(None);
         app.start_fetch(2);
-        app.set_error(Kind::Mine, "boom".into());
+        app.set_error(Kind::Mine, "boom");
         assert!(matches!(app.status(), Status::Fetching { .. }));
         app.set_list(Kind::Assigned, vec![]);
         assert_eq!(app.status(), Status::Error("Mine: boom".into()));
@@ -602,6 +626,93 @@ mod tests {
         app.next_scope();
         assert_eq!(app.scope, Scope::All);
         assert_eq!(app.mode, MatchMode::Substring);
+    }
+
+    fn substring_hits(title: &str, author: &str, scope_steps: usize, query: &str) -> Highlight {
+        let mut snapshot = Snapshot::default();
+        let mut p = pr(1);
+        p.repo = "o/gh-assigned".into();
+        p.title = title.into();
+        p.author = author.into();
+        *snapshot.get_mut(Kind::ReviewRequested) = vec![p];
+        let mut app = App::new(Some(snapshot));
+        app.next_tab();
+        app.next_mode();
+        assert_eq!(app.mode, MatchMode::Substring);
+        for _ in 0..scope_steps {
+            app.next_scope();
+        }
+        for c in query.chars() {
+            app.push_char(c);
+        }
+        assert_eq!(app.filtered, vec![0], "{query:?} in scope {:?}", app.scope);
+        app.highlight(0)
+    }
+
+    #[test]
+    fn substring_matches_up_to_the_end_of_a_field() {
+        assert_eq!(
+            substring_hits("toridori docs", "octocat", 0, "docs").title,
+            vec![9, 10, 11, 12]
+        );
+        assert_eq!(
+            substring_hits("toridori docs", "octocat", 0, "cat").author,
+            vec![4, 5, 6]
+        );
+        assert_eq!(
+            substring_hits("toridori docs", "octocat", 1, "assigned").repo,
+            (3..11).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            substring_hits("日本語のタイトル", "octocat", 2, "タイトル").title,
+            vec![4, 5, 6, 7]
+        );
+        assert_eq!(
+            substring_hits("Mixed Case", "octocat", 2, "CASE").title,
+            vec![6, 7, 8, 9]
+        );
+    }
+
+    #[test]
+    fn substring_ranks_earlier_matches_first() {
+        let mut snapshot = Snapshot::default();
+        let mut late = pr(1);
+        late.title = "fix the docs".into();
+        let mut early = pr(2);
+        early.title = "docs fix".into();
+        *snapshot.get_mut(Kind::Mine) = vec![late, early];
+        let mut app = App::new(Some(snapshot));
+        app.next_mode();
+        for c in "docs".chars() {
+            app.push_char(c);
+        }
+        assert_eq!(app.filtered, vec![1, 0]);
+    }
+
+    #[test]
+    fn hits_are_char_indices_even_with_graphemes_and_ascii() {
+        let mut snapshot = Snapshot::default();
+        let mut emoji = pr(1);
+        emoji.title = "❤\u{fe0f} fix login".into();
+        let mut ascii = pr(2);
+        ascii.title = "plain login".into();
+        ascii.author = "ali".into();
+        *snapshot.get_mut(Kind::ReviewRequested) = vec![emoji, ascii];
+        let mut app = App::new(Some(snapshot));
+        app.next_tab();
+        for c in "login".chars() {
+            app.push_char(c);
+        }
+        let by_row: Vec<(u64, Vec<usize>)> = (0..app.filtered.len())
+            .map(|pos| {
+                (
+                    app.rows()[app.filtered[pos]].pr.number,
+                    app.highlight(pos).title,
+                )
+            })
+            .collect();
+        assert!(by_row.contains(&(1, vec![7, 8, 9, 10, 11])), "{by_row:?}");
+        assert!(by_row.contains(&(2, vec![6, 7, 8, 9, 10])), "{by_row:?}");
     }
 
     #[test]
