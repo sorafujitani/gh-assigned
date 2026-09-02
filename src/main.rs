@@ -85,6 +85,22 @@ fn viewport_height(rows: usize) -> u16 {
         .min(term_rows)
 }
 
+/// The help overlay needs more rows than the list usually gets.
+fn help_viewport_height() -> u16 {
+    let term_rows = size().map(|(_, h)| h).unwrap_or(24);
+    (ui::help_rows() as u16).saturating_add(1).min(term_rows)
+}
+
+fn inline_terminal(height: u16) -> Result<Tui> {
+    let options = TerminalOptions {
+        viewport: Viewport::Inline(height),
+    };
+    Ok(Terminal::with_options(
+        CrosstermBackend::new(io::stderr()),
+        options,
+    )?)
+}
+
 fn enter_tui(rows: usize) -> Result<Tui> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -92,13 +108,14 @@ fn enter_tui(rows: usize) -> Result<Tui> {
         default_hook(info);
     }));
     enable_raw_mode()?;
-    let options = TerminalOptions {
-        viewport: Viewport::Inline(viewport_height(rows)),
-    };
-    Ok(Terminal::with_options(
-        CrosstermBackend::new(io::stderr()),
-        options,
-    )?)
+    inline_terminal(viewport_height(rows))
+}
+
+/// An inline viewport cannot grow in place, so swap in a new one at the same spot.
+fn resize_viewport(terminal: &mut Tui, height: u16) -> Result<()> {
+    let _ = terminal.clear();
+    *terminal = inline_terminal(height)?;
+    Ok(())
 }
 
 fn leave_tui(mut terminal: Tui) -> Result<()> {
@@ -179,7 +196,17 @@ fn run(
             continue;
         }
         app.clear_notice();
-        match handle_key(app, key) {
+        let help_was_open = app.help;
+        let action = handle_key(app, key);
+        if app.help != help_was_open {
+            let height = if app.help {
+                help_viewport_height()
+            } else {
+                viewport_height(app.rows().len())
+            };
+            resize_viewport(terminal, height)?;
+        }
+        match action {
             Action::Continue => {}
             Action::Reload => {
                 if !app.is_fetching() {
@@ -193,11 +220,27 @@ fn run(
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> Action {
+    if app.help {
+        app.help = false;
+        return Action::Continue;
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let plain = !key
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
     match key.code {
+        KeyCode::F(1) => {
+            app.help = true;
+            Action::Continue
+        }
+        // `?` only opens help on an empty prompt so it can still be typed mid-query.
+        // cmd-? is accepted too, though most terminals never forward it.
+        KeyCode::Char('?')
+            if app.query.is_empty() || key.modifiers.contains(KeyModifiers::SUPER) =>
+        {
+            app.help = true;
+            Action::Continue
+        }
         KeyCode::Esc => Action::Quit,
         KeyCode::Char('c' | 'q') if ctrl => Action::Quit,
         KeyCode::Enter => match app.selected() {
@@ -274,6 +317,14 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
             Action::Continue
         }
         KeyCode::Char('r') if ctrl => Action::Reload,
+        KeyCode::Char('f') if ctrl => {
+            app.next_scope();
+            Action::Continue
+        }
+        KeyCode::Char('t') if ctrl => {
+            app.next_mode();
+            Action::Continue
+        }
         KeyCode::Char(c) if plain => {
             app.push_char(c);
             Action::Continue

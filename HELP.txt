@@ -8,7 +8,9 @@ Tabs
   Assigned          PRs assigned to you
 
 Keys
-  type              fuzzy filter (repo, number, title, author)
+  type              filter over what is shown (repo, title, author)
+  ctrl-f            cycle search field: all / repo / title / author
+  ctrl-t            cycle match type: fuzzy / substring / exact (exact needs one field)
   tab / shift-tab   switch tab
   up / down         move (also ctrl-p / ctrl-n, ctrl-k / ctrl-j)
   enter             open the selected PR in the browser and exit
@@ -16,6 +18,7 @@ Keys
   Y (shift-y)       copy the selected PR URL to the clipboard
   N (shift-n)       copy the selected PR number to the clipboard
   ctrl-r            refetch
+  F1 / ?            show these keys (? only on an empty prompt)
   esc / ctrl-c      quit
 
 The list is drawn inline below the prompt, like fzf, and cleared on exit.

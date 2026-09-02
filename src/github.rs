@@ -78,6 +78,10 @@ impl Pr {
     pub fn key(&self) -> PrKey {
         (self.repo.clone(), self.number)
     }
+
+    pub fn short_repo(&self) -> &str {
+        self.repo.rsplit('/').next().unwrap_or(&self.repo)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

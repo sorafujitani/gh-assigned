@@ -30,7 +30,9 @@ gh assigned
 
 | Key | Action |
 | --- | --- |
-| type | fuzzy filter on repo, PR number, title and author |
+| type | filter on what is shown (repo, title, author); hits are highlighted |
+| `ctrl-f` | cycle search field: all / repo / title / author |
+| `ctrl-t` | cycle match type: fuzzy / substring / exact (exact only with a single field) |
 | `tab` / `shift-tab` | switch list |
 | `up` / `down`, `ctrl-p` / `ctrl-n`, `ctrl-k` / `ctrl-j` | move |
 | `enter` | open the selected PR in the browser and exit |
@@ -38,6 +40,7 @@ gh assigned
 | `Y` (shift-y) | copy the selected PR URL to the clipboard |
 | `N` (shift-n) | copy the selected PR number to the clipboard |
 | `ctrl-r` | refetch |
+| `F1` / `?` | show the key list (`?` only on an empty prompt) |
 | `esc` / `ctrl-c` | quit |
 
 Cancelling with `esc` exits with status 130, like fzf.

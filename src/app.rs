@@ -1,5 +1,5 @@
 use crate::github::{Checks, Kind, Pr, PrKey, Snapshot};
-use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::widgets::ListState;
 use std::collections::HashMap;
@@ -11,14 +11,176 @@ pub enum Status {
     Error(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    All,
+    Repo,
+    Title,
+    Author,
+}
+
+impl Scope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Scope::All => "all",
+            Scope::Repo => "repo",
+            Scope::Title => "title",
+            Scope::Author => "author",
+        }
+    }
+
+    fn next(self, show_author: bool) -> Self {
+        match self {
+            Scope::All => Scope::Repo,
+            Scope::Repo => Scope::Title,
+            Scope::Title if show_author => Scope::Author,
+            Scope::Title | Scope::Author => Scope::All,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchMode {
+    Fuzzy,
+    Substring,
+    Exact,
+}
+
+impl MatchMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            MatchMode::Fuzzy => "fuzzy",
+            MatchMode::Substring => "substring",
+            MatchMode::Exact => "exact",
+        }
+    }
+
+    // Exact only makes sense against a single field, so `All` skips it.
+    fn next(self, scope: Scope) -> Self {
+        match self {
+            MatchMode::Fuzzy => MatchMode::Substring,
+            MatchMode::Substring if scope == Scope::All => MatchMode::Fuzzy,
+            MatchMode::Substring => MatchMode::Exact,
+            MatchMode::Exact => MatchMode::Fuzzy,
+        }
+    }
+
+    fn allowed_in(self, scope: Scope) -> Self {
+        if self == MatchMode::Exact && scope == Scope::All {
+            MatchMode::Substring
+        } else {
+            self
+        }
+    }
+}
+
+/// Only what the list shows is searchable, so every hit can be highlighted.
+struct Haystack {
+    /// Fields joined by single spaces, for `Scope::All`.
+    all: String,
+    repo: String,
+    title: String,
+    author: Option<String>,
+}
+
+impl Haystack {
+    fn new(pr: &Pr, show_author: bool) -> Self {
+        let repo = pr.short_repo().to_string();
+        let author = show_author.then(|| pr.author.clone());
+        let mut all = format!("{repo} {}", pr.title);
+        if let Some(a) = &author {
+            all.push(' ');
+            all.push_str(a);
+        }
+        Haystack {
+            all,
+            repo,
+            title: pr.title.clone(),
+            author,
+        }
+    }
+
+    fn text(&self, scope: Scope) -> Option<&str> {
+        match scope {
+            Scope::All => Some(&self.all),
+            Scope::Repo => Some(&self.repo),
+            Scope::Title => Some(&self.title),
+            Scope::Author => self.author.as_deref(),
+        }
+    }
+
+    /// Split hit positions in `all` back into per-field positions.
+    fn split(&self, hits: &[u32]) -> Highlight {
+        let mut out = Highlight::default();
+        let title_start = self.repo.chars().count() + 1;
+        let author_start = title_start + self.title.chars().count() + 1;
+        for &i in hits {
+            let i = i as usize;
+            if i < title_start - 1 {
+                out.repo.push(i);
+            } else if i >= title_start && i < author_start - 1 {
+                out.title.push(i - title_start);
+            } else if i >= author_start && self.author.is_some() {
+                out.author.push(i - author_start);
+            }
+        }
+        out
+    }
+}
+
+/// How the query is matched, built once per refilter.
+enum Needle {
+    Fuzzy(Pattern),
+    Whole(Atom),
+}
+
+impl Needle {
+    fn new(query: &str, mode: MatchMode) -> Self {
+        let (case, norm) = (CaseMatching::Ignore, Normalization::Smart);
+        match mode {
+            MatchMode::Fuzzy => Needle::Fuzzy(Pattern::parse(query, case, norm)),
+            // Substring and exact take the query verbatim, spaces included.
+            MatchMode::Substring => {
+                Needle::Whole(Atom::new(query, case, norm, AtomKind::Substring, false))
+            }
+            MatchMode::Exact => Needle::Whole(Atom::new(query, case, norm, AtomKind::Exact, false)),
+        }
+    }
+
+    fn indices(
+        &self,
+        hay: Utf32Str<'_>,
+        matcher: &mut Matcher,
+        hits: &mut Vec<u32>,
+    ) -> Option<u32> {
+        match self {
+            Needle::Fuzzy(p) => p.indices(hay, matcher, hits),
+            Needle::Whole(a) => a.indices(hay, matcher, hits).map(u32::from),
+        }
+    }
+}
+
+/// Matched char positions within each displayed field.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Highlight {
+    pub repo: Vec<usize>,
+    pub title: Vec<usize>,
+    pub author: Vec<usize>,
+}
+
 pub struct App {
     snapshot: Snapshot,
     rows: Vec<crate::stack::Row>,
-    haystacks: Vec<String>,
+    haystacks: Vec<Haystack>,
     pub filtered: Vec<usize>,
+    /// Parallel to `filtered`: char indices into the row's haystack.
+    hits: Vec<Vec<u32>>,
     pub tab: Kind,
     pub query: String,
+    pub scope: Scope,
+    pub mode: MatchMode,
     pub list_state: ListState,
+    pub help: bool,
     showing_cache: bool,
     pending: usize,
     generation: u64,
@@ -35,9 +197,13 @@ impl App {
             rows: Vec::new(),
             haystacks: Vec::new(),
             filtered: Vec::new(),
+            hits: Vec::new(),
             tab: Kind::Mine,
             query: String::new(),
+            scope: Scope::All,
+            mode: MatchMode::Fuzzy,
             list_state: ListState::default(),
+            help: false,
             showing_cache,
             pending: 0,
             generation: 0,
@@ -67,6 +233,37 @@ impl App {
 
     pub fn selected(&self) -> Option<&crate::stack::Row> {
         self.filtered.get(self.cursor()).map(|&i| &self.rows[i])
+    }
+
+    /// Highlight for the `pos`-th visible row.
+    pub fn highlight(&self, pos: usize) -> Highlight {
+        let mut out = Highlight::default();
+        let (Some(&row), Some(hits)) = (self.filtered.get(pos), self.hits.get(pos)) else {
+            return out;
+        };
+        let positions = hits.iter().map(|&i| i as usize).collect();
+        match self.scope {
+            Scope::All => return self.haystacks[row].split(hits),
+            Scope::Repo => out.repo = positions,
+            Scope::Title => out.title = positions,
+            Scope::Author => out.author = positions,
+        }
+        out
+    }
+
+    fn shows_author(&self) -> bool {
+        self.tab != Kind::Mine
+    }
+
+    pub fn next_scope(&mut self) {
+        self.scope = self.scope.next(self.shows_author());
+        self.mode = self.mode.allowed_in(self.scope);
+        self.refilter();
+    }
+
+    pub fn next_mode(&mut self) {
+        self.mode = self.mode.next(self.scope);
+        self.refilter();
     }
 
     /// A one-shot message shown until the next key press, e.g. after copying.
@@ -195,15 +392,15 @@ impl App {
         // Capture the selection before `rows` changes: `filtered` indexes the old rows.
         let previous = self.selected().map(|r| r.pr.key());
         self.rows = crate::stack::arrange(self.snapshot.get(self.tab));
+        let show_author = self.shows_author();
+        if self.scope == Scope::Author && !show_author {
+            self.scope = Scope::All;
+            self.mode = self.mode.allowed_in(self.scope);
+        }
         self.haystacks = self
             .rows
             .iter()
-            .map(|r| {
-                format!(
-                    "{} #{} {} {}",
-                    r.pr.repo, r.pr.number, r.pr.title, r.pr.author
-                )
-            })
+            .map(|r| Haystack::new(&r.pr, show_author))
             .collect();
         self.filtered.clear();
         self.refilter_keeping(previous);
@@ -217,21 +414,29 @@ impl App {
     fn refilter_keeping(&mut self, previous: Option<PrKey>) {
         if self.query.is_empty() {
             self.filtered = (0..self.rows.len()).collect();
+            self.hits = vec![Vec::new(); self.rows.len()];
         } else {
-            let pattern = Pattern::parse(&self.query, CaseMatching::Ignore, Normalization::Smart);
+            let needle = Needle::new(&self.query, self.mode);
             let mut buf = Vec::new();
-            let mut scored: Vec<(u32, usize)> = self
+            let mut scored: Vec<(u32, usize, Vec<u32>)> = self
                 .haystacks
                 .iter()
                 .enumerate()
                 .filter_map(|(i, h)| {
-                    pattern
-                        .score(Utf32Str::new(h, &mut buf), &mut self.matcher)
-                        .map(|s| (s, i))
+                    let mut hits = Vec::new();
+                    let score = needle.indices(
+                        Utf32Str::new(h.text(self.scope)?, &mut buf),
+                        &mut self.matcher,
+                        &mut hits,
+                    )?;
+                    hits.sort_unstable();
+                    hits.dedup();
+                    Some((score, i, hits))
                 })
                 .collect();
             scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-            self.filtered = scored.into_iter().map(|(_, i)| i).collect();
+            self.filtered = scored.iter().map(|(_, i, _)| *i).collect();
+            self.hits = scored.into_iter().map(|(_, _, hits)| hits).collect();
         }
         let cursor = previous
             .and_then(|key| {
@@ -311,5 +516,111 @@ mod tests {
         assert!(matches!(app.status(), Status::Fetching { .. }));
         app.set_list(Kind::Assigned, vec![]);
         assert_eq!(app.status(), Status::Error("Mine: boom".into()));
+    }
+
+    #[test]
+    fn hidden_owner_and_author_do_not_match_on_mine() {
+        let mut snapshot = Snapshot::default();
+        let mut hidden = pr(1);
+        hidden.repo = "linter-org/r".into();
+        hidden.author = "linter".into();
+        hidden.title = "unrelated".into();
+        *snapshot.get_mut(Kind::Mine) = vec![hidden];
+        let mut app = App::new(Some(snapshot));
+        for c in "lint".chars() {
+            app.push_char(c);
+        }
+        assert!(app.filtered.is_empty());
+    }
+
+    #[test]
+    fn pr_number_is_not_searchable() {
+        let mut snapshot = Snapshot::default();
+        let mut p = pr(42);
+        p.title = "no digits".into();
+        *snapshot.get_mut(Kind::Mine) = vec![p];
+        let mut app = App::new(Some(snapshot));
+        app.push_char('4');
+        assert!(app.filtered.is_empty());
+    }
+
+    #[test]
+    fn scope_limits_matching_to_one_field() {
+        let mut snapshot = Snapshot::default();
+        let mut p = pr(1);
+        p.repo = "o/docs".into();
+        p.title = "api".into();
+        *snapshot.get_mut(Kind::Mine) = vec![p];
+        let mut app = App::new(Some(snapshot));
+        for c in "docs".chars() {
+            app.push_char(c);
+        }
+        assert_eq!(app.filtered, vec![0]);
+        app.next_scope();
+        assert_eq!(app.scope, Scope::Repo);
+        assert_eq!(app.filtered, vec![0]);
+        assert_eq!(app.highlight(0).repo, vec![0, 1, 2, 3]);
+        app.next_scope();
+        assert_eq!(app.scope, Scope::Title);
+        assert!(app.filtered.is_empty());
+        // Mine hides the author, so the cycle skips it.
+        app.next_scope();
+        assert_eq!(app.scope, Scope::All);
+    }
+
+    #[test]
+    fn substring_and_exact_modes() {
+        let mut snapshot = Snapshot::default();
+        let mut a = pr(1);
+        a.title = "toridori docs".into();
+        let mut b = pr(2);
+        b.title = "t o r i d o r i".into();
+        *snapshot.get_mut(Kind::Mine) = vec![a, b];
+        let mut app = App::new(Some(snapshot));
+        for c in "toridori".chars() {
+            app.push_char(c);
+        }
+        assert_eq!(app.filtered.len(), 2);
+        app.next_mode();
+        assert_eq!(app.mode, MatchMode::Substring);
+        assert_eq!(app.filtered, vec![0]);
+        // Exact is skipped while searching all fields.
+        app.next_mode();
+        assert_eq!(app.mode, MatchMode::Fuzzy);
+        app.next_scope();
+        app.next_scope();
+        assert_eq!(app.scope, Scope::Title);
+        app.next_mode();
+        app.next_mode();
+        assert_eq!(app.mode, MatchMode::Exact);
+        assert!(app.filtered.is_empty());
+        for c in " docs".chars() {
+            app.push_char(c);
+        }
+        assert_eq!(app.filtered, vec![0]);
+        // Leaving a single field drops exact back to substring.
+        app.next_scope();
+        assert_eq!(app.scope, Scope::All);
+        assert_eq!(app.mode, MatchMode::Substring);
+    }
+
+    #[test]
+    fn highlight_maps_hits_onto_repo_title_and_author() {
+        let mut snapshot = Snapshot::default();
+        let mut p = pr(1);
+        p.repo = "o/rb".into();
+        p.title = "日本 x".into();
+        p.author = "ann".into();
+        *snapshot.get_mut(Kind::ReviewRequested) = vec![p];
+        let mut app = App::new(Some(snapshot));
+        app.next_tab();
+        for c in "b本n".chars() {
+            app.push_char(c);
+        }
+        assert_eq!(app.filtered, vec![0]);
+        let h = app.highlight(0);
+        assert_eq!(h.repo, vec![1]);
+        assert_eq!(h.title, vec![1]);
+        assert_eq!(h.author, vec![1]);
     }
 }

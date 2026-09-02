@@ -1,4 +1,4 @@
-use crate::app::{App, Status};
+use crate::app::{App, Highlight, Status};
 use crate::github::{Checks, Kind, Review};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -17,6 +17,39 @@ fn dim() -> Style {
     Style::new().add_modifier(Modifier::DIM)
 }
 
+// A fixed 256-color grey: ANSI DarkGray is theme-mapped and vanishes on dark themes.
+const HIT_BG: Color = Color::Indexed(238);
+
+fn hit() -> Style {
+    Style::new().bg(HIT_BG)
+}
+
+/// Split `text` into spans, giving the chars at `hits` (shifted by `offset`) the hit background.
+fn highlighted(text: &str, hits: &[usize], offset: usize, base: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut run = String::new();
+    let mut run_hit = false;
+    for (i, c) in text.chars().enumerate() {
+        let is_hit = i >= offset && hits.contains(&(i - offset));
+        if is_hit != run_hit && !run.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(&mut run),
+                style_for(run_hit, base),
+            ));
+        }
+        run_hit = is_hit;
+        run.push(c);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, style_for(run_hit, base)));
+    }
+    spans
+}
+
+fn style_for(is_hit: bool, base: Style) -> Style {
+    if is_hit { base.patch(hit()) } else { base }
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [prompt, info, list] = Layout::vertical([
         Constraint::Length(1),
@@ -26,13 +59,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     .areas(frame.area());
 
     frame.render_widget(prompt_line(app), prompt);
-    frame.render_widget(info_line(app), info);
-    draw_list(frame, app, list);
-    frame.set_cursor_position((prompt.x + 2 + app.query.width() as u16, prompt.y));
+    if app.help {
+        draw_help(frame, info.union(list));
+    } else {
+        frame.render_widget(info_line(app), info);
+        draw_list(frame, app, list);
+    }
+    let cursor_x = mode_label(app).width() + 2 + app.query.width();
+    frame.set_cursor_position((prompt.x + cursor_x as u16, prompt.y));
+}
+
+fn mode_label(app: &App) -> String {
+    format!("{}·{} ", app.scope.label(), app.mode.label())
 }
 
 fn prompt_line(app: &App) -> Paragraph<'static> {
     Paragraph::new(Line::from(vec![
+        Span::styled(mode_label(app), dim()),
         Span::styled("> ", accent()),
         Span::raw(app.query.clone()),
     ]))
@@ -74,11 +117,32 @@ fn info_line(app: &App) -> Paragraph<'static> {
     Paragraph::new(Line::from(spans))
 }
 
-fn short_repo(repo: &str) -> &str {
-    repo.rsplit('/').next().unwrap_or(repo)
+const HELP: &str = include_str!("../HELP.txt");
+
+/// The `Keys` section of HELP.txt, so the overlay and `--help` never drift apart.
+fn help_keys() -> impl Iterator<Item = &'static str> {
+    HELP.lines()
+        .skip_while(|l| *l != "Keys")
+        .skip(1)
+        .take_while(|l| !l.is_empty())
+}
+
+/// Rows the help overlay needs below the prompt.
+pub fn help_rows() -> usize {
+    help_keys().count() + 1
+}
+
+fn draw_help(frame: &mut Frame, area: Rect) {
+    let mut lines = vec![Line::from(vec![
+        Span::styled("  keys", accent().add_modifier(Modifier::BOLD)),
+        Span::styled("   any key to close", dim()),
+    ])];
+    lines.extend(help_keys().map(Line::raw));
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 const RIGHT_MARGIN: usize = 2;
+const DRAFT_PREFIX: &str = "[draft] ";
 
 fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let width = (area.width as usize).saturating_sub(RIGHT_MARGIN);
@@ -106,7 +170,8 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
             let indent = "  ".repeat(row.depth);
             let branch = if row.depth > 0 { "└ " } else { "" };
             let tree = format!("{indent}{branch}");
-            let repo = format!("{}  ", short_repo(&pr.repo));
+            let hl: Highlight = app.highlight(pos);
+            let repo = format!("{}  ", pr.short_repo());
             let author = if author_width > 0 {
                 format!(" {:<w$}", pr.author, w = author_width)
             } else {
@@ -121,7 +186,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
             let used = pointer.width() + tree.width() + repo.width() + right.width();
             let title_width = width.saturating_sub(used);
             let full_title = if pr.is_draft {
-                format!("[draft] {}", pr.title)
+                format!("{DRAFT_PREFIX}{}", pr.title)
             } else {
                 pr.title.clone()
             };
@@ -129,22 +194,31 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
             let pad = " ".repeat(title_width.saturating_sub(title.width()));
 
             let title_style = if pr.is_draft { dim() } else { Style::new() };
-            let mut line = Line::from(vec![
+            let mut spans = vec![
                 Span::styled(pointer, accent()),
                 Span::styled(tree, accent()),
-                Span::raw(repo),
-                Span::styled(title, title_style),
-                Span::raw(pad),
-                Span::styled(
-                    format!(" {}", checks_mark(pr.checks)),
-                    checks_style(pr.checks),
-                ),
-                Span::styled(
-                    format!(" {}", review_mark(&pr.review)),
-                    review_style(&pr.review),
-                ),
-                Span::styled(author, dim()),
-            ]);
+            ];
+            spans.extend(highlighted(&repo, &hl.repo, 0, Style::new()));
+            // Hits past the truncation point would land on the ellipsis.
+            let kept = title.chars().count() - usize::from(title != full_title);
+            let title_hits: Vec<usize> = hl
+                .title
+                .iter()
+                .map(|&i| i + DRAFT_PREFIX.chars().count() * usize::from(pr.is_draft))
+                .filter(|&i| i < kept)
+                .collect();
+            spans.extend(highlighted(&title, &title_hits, 0, title_style));
+            spans.push(Span::raw(pad));
+            spans.push(Span::styled(
+                format!(" {}", checks_mark(pr.checks)),
+                checks_style(pr.checks),
+            ));
+            spans.push(Span::styled(
+                format!(" {}", review_mark(&pr.review)),
+                review_style(&pr.review),
+            ));
+            spans.extend(highlighted(&author, &hl.author, 1, dim()));
+            let mut line = Line::from(spans);
             if current {
                 line = line.style(Style::new().add_modifier(Modifier::BOLD));
             }
@@ -261,6 +335,7 @@ mod tests {
         let mut app = App::new(Some(stacked()));
         let out = render(&mut app, 80);
         assert!(out.contains("3/3"));
+        assert!(out.contains("all·fuzzy > "), "{out}");
         assert!(out.contains("▌ r  first"));
         assert!(out.contains("  └ r  [draft] second"));
         assert!(!out.contains(" me"), "author is hidden on Mine");
@@ -269,6 +344,7 @@ mod tests {
             app.push_char(c);
         }
         let out = render(&mut app, 80);
+        assert!(out.contains("all·fuzzy > unrel"), "{out}");
         assert!(out.contains("1/3"));
         assert!(out.contains("r  unrelated"));
         assert!(!out.contains("first"));
@@ -301,6 +377,33 @@ mod tests {
         app.set_list(Kind::Mine, vec![pr(1, "main", "a", "first")]);
         assert!(render(&mut app, 80).contains(" fetching…"));
         assert!(!render(&mut app, 80).contains("cached"));
+    }
+
+    #[test]
+    fn matched_chars_get_a_background() {
+        let mut app = App::new(Some(stacked()));
+        for c in "unrel".chars() {
+            app.push_char(c);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let row = 2;
+        let marked: String = (0..buf.area.width)
+            .filter(|&x| buf[(x, row)].bg == HIT_BG)
+            .map(|x| buf[(x, row)].symbol().to_string())
+            .collect();
+        assert_eq!(marked, "unrel");
+    }
+
+    #[test]
+    fn help_overlay_lists_keys_and_hides_the_list() {
+        let mut app = App::new(Some(stacked()));
+        app.help = true;
+        let out = render(&mut app, 80);
+        assert!(out.contains("any key to close"), "{out}");
+        assert!(out.contains("ctrl-r"), "{out}");
+        assert!(!out.contains("first"), "{out}");
     }
 
     #[test]
