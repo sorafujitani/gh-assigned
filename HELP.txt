@@ -22,8 +22,8 @@ Keys
   F1 / ?            show these keys (? only on an empty prompt); esc closes
   esc / ctrl-c      quit
 
-The prompt is prefixed with the search mode (e.g. `repo·exact >`) whenever it
-differs from the default all·fuzzy.
+The prompt is prefixed with the current search mode, e.g. `all·fuzzy >` or
+`repo·exact >`.
 
 The list is drawn inline below the prompt, like fzf, and cleared on exit.
 The last result is cached under the user cache directory and shown

@@ -43,7 +43,7 @@ gh assigned
 | `F1` / `?` | show the key list (`?` only on an empty prompt); `esc` closes |
 | `esc` / `ctrl-c` | quit |
 
-The prompt is prefixed with the search mode (for example `repo·exact >`) whenever it differs from the default all·fuzzy.
+The prompt is prefixed with the current search mode, for example `all·fuzzy >` or `repo·exact >`.
 
 Cancelling with `esc` exits with status 130, like fzf.
 
@@ -54,11 +54,11 @@ Cancelling with `esc` exits with status 130, like fzf.
 Drawn inline below your prompt like fzf, using at most 40% of the terminal. The shell scrollback stays visible and the area is cleared on exit.
 
 ```
-> query
+all·fuzzy > query
   28/28  mine 28 · review requested 2 · assigned 7
-▌ marketing-backend  TAS-320 pnpm を更新                     ✓ approved
-  └ marketing-backend  TAS-319 NestJS 11 へ更新               ✓ approved
-  marketing-backend  fix: INVALID_OOB_CODE エラー               ✓ review
+▌ gh-assigned  Add fuzzy search modes                 ✓ approved
+  └ gh-assigned  Highlight matching text                 ✓ approved
+  ccsession    Preserve metadata when resuming a session  ✓ review
 ```
 
 `✓` `✗` `●` show the CI rollup of the latest commit, followed by the review decision. Drafts are dimmed and prefixed with `[draft]`. The author column is shown only on the review-requested and assigned lists.

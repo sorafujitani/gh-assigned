@@ -1,6 +1,7 @@
 mod app;
 mod cache;
 mod github;
+#[cfg(feature = "demo")]
 mod mock;
 mod stack;
 mod ui;
@@ -54,7 +55,8 @@ const PAGE_STEP: isize = 10;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DataMode {
     Live,
-    Mock,
+    /// Fixed data for recordings; never touches GitHub or the cache.
+    #[cfg(feature = "demo")]
     Demo,
 }
 
@@ -62,12 +64,13 @@ impl DataMode {
     fn fixture(self) -> Option<github::Snapshot> {
         match self {
             DataMode::Live => None,
-            DataMode::Mock | DataMode::Demo => Some(mock::snapshot()),
+            #[cfg(feature = "demo")]
+            DataMode::Demo => Some(mock::snapshot()),
         }
     }
 
     fn fetches_github(self) -> bool {
-        !matches!(self, DataMode::Mock)
+        self == DataMode::Live
     }
 }
 
@@ -82,6 +85,8 @@ fn main() -> Result<ExitCode> {
         [] => DataMode::Live,
         ["-h" | "--help"] => {
             print!("{}", include_str!("../HELP.txt"));
+            #[cfg(feature = "demo")]
+            print!("{}", github::DEMO_HELP);
             return Ok(ExitCode::SUCCESS);
         }
         ["--json"] => {
@@ -90,7 +95,7 @@ fn main() -> Result<ExitCode> {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
             return Ok(ExitCode::SUCCESS);
         }
-        ["--mock"] => DataMode::Mock,
+        #[cfg(feature = "demo")]
         ["--demo"] => DataMode::Demo,
         _ => bail!(
             "unknown arguments: {}\nSee `gh assigned --help`.",
@@ -112,7 +117,7 @@ fn main() -> Result<ExitCode> {
         load_fixture(&mut app, &snapshot);
     }
     if mode.fetches_github() {
-        start_fetch(&mut app, &tx, mode);
+        start_fetch(&mut app, &tx);
     }
 
     // Drawn inline on stderr, fzf-style, so the shell scrollback stays visible.
@@ -221,24 +226,13 @@ fn load_fixture(app: &mut App, snapshot: &github::Snapshot) {
     }
 }
 
-fn list_for(mode: DataMode, kind: Kind) -> Result<Vec<github::Pr>> {
-    match mode {
-        DataMode::Live | DataMode::Mock => github::fetch_list(kind),
-        DataMode::Demo => {
-            let mut prs = github::fetch_demo_list(kind)?;
-            prs.append(&mut mock::list(kind));
-            Ok(prs)
-        }
-    }
-}
-
 /// Lists and CI state are independent queries, so all six run at once.
-fn start_fetch(app: &mut App, tx: &mpsc::Sender<Tagged>, mode: DataMode) {
+fn start_fetch(app: &mut App, tx: &mpsc::Sender<Tagged>) {
     let generation = app.start_fetch(Kind::ALL.len() * 2);
     for kind in Kind::ALL {
         let tx_list = tx.clone();
         std::thread::spawn(move || {
-            let msg = Msg::List(kind, list_for(mode, kind));
+            let msg = Msg::List(kind, github::fetch_list(kind));
             let _ = tx_list.send(Tagged { generation, msg });
         });
         let tx_checks = tx.clone();
@@ -318,7 +312,7 @@ fn run(
             Action::Reload => {
                 if !app.is_fetching() {
                     if mode.fetches_github() {
-                        start_fetch(app, tx, mode);
+                        start_fetch(app, tx);
                     } else if let Some(snapshot) = mode.fixture() {
                         load_fixture(app, &snapshot);
                     }

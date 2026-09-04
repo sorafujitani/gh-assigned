@@ -1,4 +1,4 @@
-use crate::app::{App, MatchMode, Scope, Status};
+use crate::app::{App, Status};
 use crate::github::{Checks, Kind, Review};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -76,15 +76,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     frame.set_cursor_position((prompt.x.saturating_add(cursor_x), prompt.y));
 }
 
-/// Shown only when the search differs from the default all·fuzzy.
 const PROMPT: &str = "> ";
 
+/// Always shown so the default all·fuzzy is as visible as any other setting.
 fn mode_label(app: &App) -> String {
-    if app.scope == Scope::All && app.mode == MatchMode::Fuzzy {
-        String::new()
-    } else {
-        format!("{}·{} ", app.scope.label(), app.mode.label())
-    }
+    format!("{}·{} ", app.scope.label(), app.mode.label())
 }
 
 fn prompt_line(app: &App) -> Paragraph<'static> {
@@ -402,8 +398,7 @@ mod tests {
             app.push_char(c);
         }
         let out = render(&mut app, 80);
-        assert!(out.contains("> unrel"), "{out}");
-        assert!(!out.contains("all·fuzzy"), "default mode is not labelled");
+        assert!(out.contains("all·fuzzy > unrel"), "{out}");
         assert!(out.contains("1/3"));
         assert!(out.contains("r  unrelated"));
         assert!(!out.contains("first"));

@@ -1,108 +1,243 @@
 use crate::github::{Checks, Kind, Pr, Review, Snapshot};
 
-/// A deterministic fixture for previewing the client without contacting GitHub.
+/// Fixed data for recordings: a frozen copy of real public PRs followed by invented ones.
 pub fn snapshot() -> Snapshot {
     Snapshot {
         lists: Kind::ALL.map(list),
     }
 }
 
-pub fn list(kind: Kind) -> Vec<Pr> {
-    match kind {
-        Kind::Mine => mine(),
-        Kind::ReviewRequested => review_requested(),
-        Kind::Assigned => assigned(),
-    }
+fn list(kind: Kind) -> Vec<Pr> {
+    let (mut live, mut invented) = match kind {
+        Kind::Mine => (live_mine(), mine()),
+        Kind::ReviewRequested => (live_review_requested(), review_requested()),
+        Kind::Assigned => (live_assigned(), assigned()),
+    };
+    live.append(&mut invented);
+    live
 }
+
+fn live_mine() -> Vec<Pr> {
+    vec![
+        pr(
+            "sorafujitani/kaguya",
+            8,
+            "Cut runtime RSS with leaner buffers, caches, and atlas caps",
+            "sorafujitani",
+            state(
+                "main",
+                "cursor/reduce-memory-usage-06aa",
+                true,
+                Checks::Failure,
+                Review::None,
+            ),
+        ),
+        pr(
+            "oxc-project/oxc",
+            22825,
+            "feat(linter/jest/vitest): implement padding-around-before-all-blocks",
+            "sorafujitani",
+            state(
+                "main",
+                "492/padding-around-before-all-blocks",
+                false,
+                Checks::None,
+                Review::None,
+            ),
+        ),
+        pr(
+            "oxc-project/oxc",
+            23286,
+            "feat(linter/jest/vitest): implement padding-around-expect-groups",
+            "sorafujitani",
+            state(
+                "main",
+                "492/padding-around-expect-groups",
+                false,
+                Checks::None,
+                Review::None,
+            ),
+        ),
+        pr(
+            "xwmx/nb",
+            418,
+            "Auto-detect remote's default branch in `nb remote set`",
+            "sorafujitani",
+            state(
+                "master",
+                "feature/git-branch-remote-sync",
+                false,
+                Checks::Success,
+                Review::None,
+            ),
+        ),
+        pr(
+            "sorafujitani/nobunaga",
+            2,
+            "Rust Prism extension, RuboCop parity docs, and CI",
+            "sorafujitani",
+            state(
+                "main",
+                "cursor/cloud-agent-1775329011757-j8slq",
+                false,
+                Checks::Success,
+                Review::None,
+            ),
+        ),
+        pr(
+            "sorafujitani/rfmt",
+            64,
+            "feat: Add insta snapshot tests for formatter",
+            "sorafujitani",
+            state(
+                "main",
+                "feat/insta-snapshot-tests",
+                false,
+                Checks::Success,
+                Review::None,
+            ),
+        ),
+        pr(
+            "sorafujitani/ruby-lsp-addon-template",
+            1,
+            "Create Ruby LSP custom addon implementation guide",
+            "sorafujitani",
+            state(
+                "main",
+                "claude/ruby-lsp-addon-guide-011CUiYCy2jceg9QdQB4jDK6",
+                false,
+                Checks::Success,
+                Review::None,
+            ),
+        ),
+    ]
+}
+
+fn live_review_requested() -> Vec<Pr> {
+    vec![
+        pr(
+            "yamada-ui/yamada-ui",
+            7609,
+            "Added tip section for list components",
+            "108yen",
+            state(
+                "main",
+                "docs/list",
+                false,
+                Checks::Success,
+                Review::ChangesRequested,
+            ),
+        ),
+        pr(
+            "yamada-ui/yamada-ui",
+            6124,
+            "feat(cli): add view command to inspect and download component files",
+            "SahilJat",
+            state(
+                "v2.3",
+                "feat/cli-view-command",
+                false,
+                Checks::Failure,
+                Review::None,
+            ),
+        ),
+    ]
+}
+
+fn live_assigned() -> Vec<Pr> {
+    vec![]
+}
+
+const ME: &str = "sorafujitani";
 
 fn mine() -> Vec<Pr> {
     vec![
         pr(
-            "northstar/checkout-service",
-            1842,
-            "Add idempotency keys to payment capture",
-            "alex.morgan",
+            "sorafujitani/rfmt",
+            312,
+            "Preserve trailing commas in multi-line match arms",
+            ME,
             state(
                 "main",
-                "feat/payment-idempotency",
+                "feat/match-arm-commas",
                 false,
                 Checks::Success,
                 Review::Approved,
             ),
         ),
         pr(
-            "northstar/checkout-service",
-            1843,
-            "Cover payment retries with gateway contract tests",
-            "alex.morgan",
+            "sorafujitani/rfmt",
+            313,
+            "Cover match arm formatting with snapshot tests",
+            ME,
             state(
-                "feat/payment-idempotency",
-                "feat/payment-idempotency-tests",
+                "feat/match-arm-commas",
+                "feat/match-arm-commas-tests",
                 false,
                 Checks::Pending,
                 Review::Pending,
             ),
         ),
         pr(
-            "northstar/checkout-service",
-            1844,
-            "Document retry semantics for capture endpoints",
-            "alex.morgan",
+            "sorafujitani/rfmt",
+            314,
+            "Document the comma rules in the style guide",
+            ME,
             state(
-                "feat/payment-idempotency-tests",
-                "feat/payment-idempotency-docs",
+                "feat/match-arm-commas-tests",
+                "feat/match-arm-commas-docs",
                 true,
                 Checks::None,
                 Review::Pending,
             ),
         ),
         pr(
-            "northstar/account-console",
-            932,
-            "Preserve the active organization after session refresh",
-            "alex.morgan",
+            "sorafujitani/ccsession",
+            148,
+            "Resume the most recent session when no id is given",
+            ME,
             state(
                 "main",
-                "feat/session-refresh",
+                "feat/resume-latest",
                 false,
                 Checks::Success,
                 Review::Approved,
             ),
         ),
         pr(
-            "meridian/data-platform",
-            617,
-            "Backfill invoice dimensions without locking the ledger",
-            "alex.morgan",
+            "sorafujitani/rt",
+            97,
+            "Stream task output instead of buffering it",
+            ME,
             state(
                 "main",
-                "fix/invoice-backfill",
+                "fix/stream-output",
                 true,
                 Checks::Pending,
                 Review::None,
             ),
         ),
         pr(
-            "meridian/edge-gateway",
-            1205,
-            "Add bounded retries for transient upstream failures",
-            "alex.morgan",
+            "oxc-project/oxc",
+            9821,
+            "linter: add bounded retries to the language server restart",
+            ME,
             state(
                 "main",
-                "feat/upstream-retries",
+                "feat/lsp-restart-retries",
                 false,
                 Checks::Failure,
                 Review::ChangesRequested,
             ),
         ),
         pr(
-            "northstar/design-system",
-            288,
-            "Add reduced-motion variants for toast notifications",
-            "alex.morgan",
+            "sorafujitani/sorafujitani.me",
+            61,
+            "Add reduced-motion variants for page transitions",
+            ME,
             state(
                 "main",
-                "feat/reduced-motion-toasts",
+                "feat/reduced-motion",
                 false,
                 Checks::Success,
                 Review::Pending,
@@ -114,9 +249,9 @@ fn mine() -> Vec<Pr> {
 fn review_requested() -> Vec<Pr> {
     vec![
         pr(
-            "northstar/checkout-service",
-            1851,
-            "Move webhook signature verification into the shared gateway",
+            "topi-log/topi-log",
+            221,
+            "Move webhook signature verification into the shared middleware",
             "maya.chen",
             state(
                 "main",
@@ -127,8 +262,8 @@ fn review_requested() -> Vec<Pr> {
             ),
         ),
         pr(
-            "northstar/checkout-service",
-            1852,
+            "topi-log/topi-log",
+            222,
             "Reject replayed webhook deliveries after signature validation",
             "maya.chen",
             state(
@@ -140,9 +275,9 @@ fn review_requested() -> Vec<Pr> {
             ),
         ),
         pr(
-            "meridian/edge-gateway",
-            1210,
-            "Retry upstream connections with bounded exponential backoff",
+            "sorafujitani/pi",
+            58,
+            "Retry provider connections with bounded exponential backoff",
             "jordan.lee",
             state(
                 "main",
@@ -153,8 +288,8 @@ fn review_requested() -> Vec<Pr> {
             ),
         ),
         pr(
-            "northstar/mobile-app",
-            441,
+            "sorafujitani/kaguya",
+            34,
             "Support passkeys in the account recovery flow",
             "priya.shah",
             state(
@@ -166,22 +301,22 @@ fn review_requested() -> Vec<Pr> {
             ),
         ),
         pr(
-            "meridian/analytics-api",
-            139,
-            "Expose cohort retention windows in the reporting endpoint",
+            "sorafujitani/panopticon",
+            79,
+            "Expose retention windows in the reporting endpoint",
             "daniel.kim",
             state(
                 "main",
-                "feat/cohort-retention",
+                "feat/retention-windows",
                 false,
                 Checks::None,
                 Review::Pending,
             ),
         ),
         pr(
-            "northstar/design-system",
-            291,
-            "Align modal focus trapping with the keyboard specification",
+            "yamada-ui/yamada-ui",
+            4410,
+            "fix(modal): align focus trapping with the keyboard specification",
             "elena.morales",
             state(
                 "main",
@@ -192,8 +327,8 @@ fn review_requested() -> Vec<Pr> {
             ),
         ),
         pr(
-            "meridian/warehouse-jobs",
-            326,
+            "sorafujitani/graphnote",
+            126,
             "Make nightly exports resumable after a worker restart",
             "noah.wilson",
             state(
@@ -210,60 +345,60 @@ fn review_requested() -> Vec<Pr> {
 fn assigned() -> Vec<Pr> {
     vec![
         pr(
-            "northstar/checkout-service",
-            1860,
-            "Document the refund reconciliation runbook",
+            "sorafujitani/ccsession",
+            151,
+            "Document the session recovery runbook",
             "liam.nguyen",
             state(
                 "main",
-                "docs/refund-reconciliation",
+                "docs/session-recovery",
                 false,
                 Checks::Success,
                 Review::None,
             ),
         ),
         pr(
-            "meridian/edge-gateway",
-            1214,
-            "Remove legacy X-Forwarded-For parsing",
+            "sorafujitani/rt",
+            101,
+            "Remove legacy environment file parsing",
             "jordan.lee",
             state(
                 "main",
-                "cleanup/forwarded-for",
+                "cleanup/env-parsing",
                 false,
                 Checks::Success,
                 Review::Pending,
             ),
         ),
         pr(
-            "meridian/edge-gateway",
-            1215,
-            "Add coverage for forwarded header normalization",
+            "sorafujitani/rt",
+            102,
+            "Add coverage for environment normalization",
             "jordan.lee",
             state(
-                "cleanup/forwarded-for",
-                "cleanup/forwarded-for-tests",
+                "cleanup/env-parsing",
+                "cleanup/env-parsing-tests",
                 false,
                 Checks::Success,
                 Review::Pending,
             ),
         ),
         pr(
-            "northstar/account-console",
-            948,
-            "Keep organization filters when switching workspaces",
+            "sorafujitani/kaguya",
+            36,
+            "Keep filters when switching workspaces",
             "sophie.martin",
             state(
                 "main",
-                "feat/persistent-org-filter",
+                "feat/persistent-filters",
                 false,
                 Checks::Failure,
                 Review::ChangesRequested,
             ),
         ),
         pr(
-            "meridian/data-platform",
-            633,
+            "sorafujitani/panopticon",
+            82,
             "Add partition-pruning metrics to nightly exports",
             "omar.hassan",
             state(
@@ -275,21 +410,21 @@ fn assigned() -> Vec<Pr> {
             ),
         ),
         pr(
-            "northstar/mobile-sdk",
-            88,
-            "Add offline upload retries for background sync",
+            "honojs/hono",
+            3877,
+            "feat(jsx): add offline retries for streamed responses",
             "isabella.rossi",
             state(
                 "main",
-                "feat/offline-upload-retries",
+                "feat/stream-retries",
                 true,
                 Checks::None,
                 Review::None,
             ),
         ),
         pr(
-            "northstar/design-system",
-            299,
+            "sorafujitani/sorafujitani.me",
+            64,
             "Expose semantic colors for destructive actions",
             "ben.carter",
             state(
@@ -374,8 +509,13 @@ mod tests {
     fn fixture_contains_stacked_pull_requests() {
         let snapshot = snapshot();
         let prs = snapshot.get(Kind::Mine);
+        let by_number = |n: u64| {
+            prs.iter()
+                .find(|pr| pr.number == n)
+                .unwrap_or_else(|| panic!("fixture should contain #{n}"))
+        };
 
-        assert_eq!(prs[1].base_ref, prs[0].head_ref);
-        assert_eq!(prs[2].base_ref, prs[1].head_ref);
+        assert_eq!(by_number(313).base_ref, by_number(312).head_ref);
+        assert_eq!(by_number(314).base_ref, by_number(313).head_ref);
     }
 }

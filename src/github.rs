@@ -144,17 +144,9 @@ pub fn fetch_list(kind: Kind) -> Result<Vec<Pr>> {
     parse_list(&run_gh(&search_query(kind, PR_FIELDS))?)
 }
 
-/// Open PRs for the temporary demo, excluding company-owned repositories.
-pub fn fetch_demo_list(kind: Kind) -> Result<Vec<Pr>> {
-    let mut prs = fetch_list(kind)?;
-    prs.retain(|pr| !belongs_to_org(&pr.repo, "toridori-inc"));
-    Ok(prs)
-}
-
-fn belongs_to_org(repo: &str, org: &str) -> bool {
-    repo.split_once('/')
-        .is_some_and(|(owner, _)| owner.eq_ignore_ascii_case(org))
-}
+#[cfg(feature = "demo")]
+pub const DEMO_HELP: &str =
+    "\nDemo build\n  --demo            show fixed demo data without contacting GitHub\n";
 
 /// CI state for one list.
 pub fn fetch_checks(kind: Kind) -> Result<HashMap<PrKey, Checks>> {
@@ -427,17 +419,6 @@ mod tests {
         assert!(q.contains("review-requested:@me"), "{q}");
         assert!(q.contains("first: 100"), "{q}");
         assert!(q.contains("reviewDecision"), "{q}");
-    }
-
-    #[test]
-    fn demo_filter_matches_only_the_excluded_org_owner() {
-        assert!(belongs_to_org("toridori-inc/checkout", "toridori-inc"));
-        assert!(belongs_to_org("TORIDORI-INC/checkout", "toridori-inc"));
-        assert!(!belongs_to_org(
-            "toridori-incubator/checkout",
-            "toridori-inc"
-        ));
-        assert!(!belongs_to_org("other/toridori-inc", "toridori-inc"));
     }
 
     #[test]
