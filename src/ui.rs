@@ -5,7 +5,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const ACCENT: Color = Color::Cyan;
 
@@ -57,19 +57,25 @@ fn style_for(is_hit: bool, base: Style) -> Style {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [prompt, info, list] = Layout::vertical([
+    let notice = notice_widget(app, frame.area().width);
+    let notice_height = notice.as_ref().map_or(0, |(_, height)| *height);
+    let [prompt, info, notice_area, list] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
+        Constraint::Length(notice_height),
         Constraint::Min(1),
     ])
     .areas(frame.area());
 
     frame.render_widget(prompt_line(app), prompt);
     if app.help {
-        draw_help(frame, info.union(list));
+        draw_help(frame, info.union(notice_area).union(list));
         return;
     }
     frame.render_widget(info_line(app), info);
+    if let Some((notice, _)) = notice {
+        frame.render_widget(notice, notice_area);
+    }
     draw_list(frame, app, list);
     let cursor_x = mode_label(app).width() + PROMPT.width() + app.query.width();
     let cursor_x = u16::try_from(cursor_x).unwrap_or(u16::MAX);
@@ -119,12 +125,64 @@ fn info_line(app: &App) -> Paragraph<'static> {
         Status::Error(e) => Span::styled(format!("   error: {e}"), Style::new().fg(Color::Red)),
     };
     spans.push(status);
-    match app.notice() {
-        Some(Ok(msg)) => spans.push(Span::styled(format!("   {msg}"), accent())),
-        Some(Err(e)) => spans.push(Span::styled(format!("   {e}"), Style::new().fg(Color::Red))),
-        None => {}
-    }
     Paragraph::new(Line::from(spans))
+}
+
+fn notice_widget(app: &App, width: u16) -> Option<(Paragraph<'static>, u16)> {
+    let (message, style) = match app.notice()? {
+        Ok(message) => (message, accent()),
+        Err(error) => (error, Style::new().fg(Color::Red)),
+    };
+    let lines = wrap_notice(&format!("   {message}"), width as usize);
+    let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let lines = lines
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line, style)))
+        .collect::<Vec<_>>();
+    Some((Paragraph::new(lines), height))
+}
+
+fn wrap_notice(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    text.split('\n')
+        .flat_map(|line| wrap_notice_line(line, width))
+        .collect()
+}
+
+fn wrap_notice_line(mut remaining: &str, width: usize) -> Vec<String> {
+    if remaining.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines = Vec::new();
+    while remaining.width() > width {
+        let mut line_width = 0;
+        let mut hard_break = None;
+        let mut word_break = None;
+        for (index, character) in remaining.char_indices() {
+            let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if line_width + character_width > width {
+                break;
+            }
+            line_width += character_width;
+            hard_break = Some(index + character.len_utf8());
+            if character.is_whitespace() {
+                word_break = hard_break;
+            }
+        }
+        let split_at = word_break.or(hard_break).unwrap_or_else(|| {
+            remaining
+                .chars()
+                .next()
+                .map_or(remaining.len(), char::len_utf8)
+        });
+        let (line, rest) = remaining.split_at(split_at);
+        lines.push(line.to_owned());
+        remaining = rest;
+    }
+    lines.push(remaining.to_owned());
+    lines
 }
 
 const HELP: &str = include_str!("../HELP.txt");
@@ -433,6 +491,24 @@ mod tests {
         app.set_list(Kind::Mine, vec![pr(1, "main", "a", "first")]);
         assert!(render(&mut app, 80).contains(" fetching…"));
         assert!(!render(&mut app, 80).contains("cached"));
+    }
+
+    #[test]
+    fn notice_wraps_below_status_on_a_narrow_terminal() {
+        let mut app = App::new(Some(stacked()));
+        let url = "https://github.com/o/r/pull/8";
+        app.notify(Err(anyhow::anyhow!(
+            "could not open {url}: try `gh auth login`, then check GH_BROWSER/BROWSER"
+        )));
+        let out = render(&mut app, 40);
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert!(!lines[1].contains("could not open"), "{out}");
+        assert!(lines.iter().skip(2).any(|line| line.contains(url)), "{out}");
+        assert!(
+            lines.iter().skip(2).any(|line| line.contains("auth login")),
+            "{out}"
+        );
     }
 
     #[test]

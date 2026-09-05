@@ -6,7 +6,7 @@ mod mock;
 mod stack;
 mod ui;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use app::App;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
@@ -14,6 +14,7 @@ use github::{Checks, Kind, PrKey};
 use ratatui::prelude::CrosstermBackend;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{self, IsTerminal};
 use std::process::{Command, ExitCode};
 use std::sync::mpsc;
@@ -24,6 +25,7 @@ use std::time::Duration;
 enum Action {
     Continue,
     Reload,
+    OpenInBrowser(String),
     Finish(Outcome),
 }
 
@@ -128,7 +130,7 @@ fn main() -> Result<ExitCode> {
 
     match result? {
         Outcome::Open(url) => {
-            open_in_browser(&url);
+            open_in_browser(&url)?;
             Ok(ExitCode::SUCCESS)
         }
         Outcome::Cancel => Ok(ExitCode::from(EXIT_CANCELLED)),
@@ -309,6 +311,9 @@ fn run(
         }
         match action {
             Action::Continue => {}
+            Action::OpenInBrowser(url) => {
+                notify_browser_result(app, &url, open_in_browser(&url));
+            }
             Action::Reload => {
                 if !app.is_fetching() {
                     if mode.fetches_github() {
@@ -357,12 +362,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
             None => Action::Continue,
         },
         // Open without leaving, for going through several PRs.
-        KeyCode::Char('O') if plain => {
-            if let Some(row) = app.selected() {
-                open_in_browser(&row.pr.url);
-            }
-            Action::Continue
-        }
+        KeyCode::Char('O') if plain => app.selected().map_or(Action::Continue, |row| {
+            Action::OpenInBrowser(row.pr.url.clone())
+        }),
         KeyCode::Char('Y') if plain => {
             if let Some(row) = app.selected() {
                 let url = row.pr.url.clone();
@@ -438,15 +440,211 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
     bail!("no clipboard command found")
 }
 
-fn open_in_browser(url: &str) {
-    let (program, args): (&str, Vec<&str>) = match std::env::consts::OS {
-        "macos" => ("open", vec![url]),
-        "windows" => ("cmd", vec!["/C", "start", "", url]),
-        _ => ("xdg-open", vec![url]),
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserCommand {
+    program: OsString,
+    args: Vec<OsString>,
+}
+
+fn open_in_browser(url: &str) -> Result<()> {
+    run_browser_command(&browser_command(), url)
+}
+
+fn notify_browser_result(app: &mut App, url: &str, result: Result<()>) {
+    app.notify(result.map(|()| format!("opened {url}")));
+}
+
+/// Lets gh apply its configured browser preference and launch policy.
+fn browser_command() -> BrowserCommand {
+    BrowserCommand {
+        program: OsString::from("gh"),
+        args: ["pr", "view"].into_iter().map(OsString::from).collect(),
+    }
+}
+
+fn browser_recovery() -> &'static str {
+    "try `gh auth login`, then check network access and GH_BROWSER/BROWSER or `gh config get browser`"
+}
+
+fn run_browser_command(command: &BrowserCommand, url: &str) -> Result<()> {
+    let display = command.program.to_string_lossy();
+    let output = Command::new(&command.program)
+        .args(&command.args)
+        .arg(url)
+        .arg("--web")
+        .output()
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                anyhow!(
+                    "could not open {url}: gh command `{display}` was not found; install GitHub CLI; {}",
+                    browser_recovery()
+                )
+            } else {
+                anyhow!(
+                    "could not open {url} with gh command `{display}`: {error}; {}",
+                    browser_recovery()
+                )
+            }
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let detail = if stderr.is_empty() {
+        format!("exited with {}", output.status)
+    } else {
+        format!("exited with {}: {stderr}", output.status)
     };
-    let _ = Command::new(program)
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    bail!(
+        "could not open {url} with gh command `{display}`: {detail}; {}",
+        browser_recovery()
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::{Pr, Review, Snapshot};
+
+    const URL: &str = "https://github.com/o/r/pull/8";
+
+    fn app_with_selection() -> App {
+        let mut snapshot = Snapshot::default();
+        *snapshot.get_mut(Kind::Mine) = vec![Pr {
+            repo: "o/r".into(),
+            number: 8,
+            title: "test".into(),
+            url: URL.into(),
+            author: "octocat".into(),
+            is_draft: false,
+            base_ref: "main".into(),
+            head_ref: "test".into(),
+            checks: Checks::None,
+            review: Review::None,
+        }];
+        App::new(Some(snapshot))
+    }
+
+    fn command(program: &str, args: &[&str]) -> BrowserCommand {
+        BrowserCommand {
+            program: program.into(),
+            args: args.iter().map(|arg| (*arg).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn enter_finishes_with_the_selected_url() {
+        let mut app = app_with_selection();
+        let action = handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(action, Action::Finish(Outcome::Open(url)) if url == URL));
+    }
+
+    #[test]
+    fn shift_o_requests_open_without_finishing() {
+        let mut app = app_with_selection();
+        let action = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT),
+        );
+        assert!(matches!(action, Action::OpenInBrowser(url) if url == URL));
+    }
+
+    #[test]
+    fn shift_o_keeps_browser_failure_and_url_in_the_tui() {
+        let mut app = app_with_selection();
+        let Action::OpenInBrowser(url) = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT),
+        ) else {
+            panic!("Shift-O should keep the TUI open");
+        };
+        let command = command("gh-assigned-browser-command-that-does-not-exist", &[]);
+        notify_browser_result(&mut app, &url, run_browser_command(&command, &url));
+        assert!(matches!(app.notice(), Some(Err(error)) if error.contains(URL)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_receives_pr_url_and_web_in_order() -> io::Result<()> {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = std::env::temp_dir().join(format!(
+            "gh-assigned-fake-gh-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_nanos()
+        ));
+        fs::create_dir(&dir)?;
+        let fake_gh = dir.join("gh");
+        fs::write(&fake_gh, "#!/bin/sh\nprintf '%s\\n' \"$@\" >&2\nexit 1\n")?;
+        let mut permissions = fs::metadata(&fake_gh)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&fake_gh, permissions)?;
+
+        let mut command = browser_command();
+        if command.program != "gh" {
+            return Err(io::Error::other("browser command should delegate to gh"));
+        }
+        command.program = fake_gh.into();
+        let error = match run_browser_command(&command, URL) {
+            Ok(()) => return Err(io::Error::other("fake gh should fail")),
+            Err(error) => error.to_string(),
+        };
+        fs::remove_dir_all(&dir)?;
+
+        if !error.contains(&format!("pr\nview\n{URL}\n--web")) {
+            return Err(io::Error::other(format!("unexpected arguments: {error}")));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_browser_command_includes_url_and_recovery() {
+        let command = command("gh-assigned-browser-command-that-does-not-exist", &[]);
+        let error = run_browser_command(&command, URL).unwrap_err().to_string();
+        assert!(error.contains(URL));
+        assert!(error.contains("was not found"));
+        assert!(error.contains("GH_BROWSER/BROWSER"));
+        assert!(error.contains("gh auth login"));
+    }
+
+    #[test]
+    fn nonzero_browser_exit_includes_url_and_status() {
+        let command = nonzero_command();
+        let error = run_browser_command(&command, URL).unwrap_err().to_string();
+        assert!(error.contains(URL));
+        assert!(error.contains("exited with"));
+    }
+
+    #[test]
+    fn successful_browser_exit_is_accepted() {
+        assert!(matches!(
+            run_browser_command(&success_command(), URL),
+            Ok(())
+        ));
+    }
+
+    #[cfg(unix)]
+    fn nonzero_command() -> BrowserCommand {
+        command("false", &[])
+    }
+
+    #[cfg(windows)]
+    fn nonzero_command() -> BrowserCommand {
+        command("cmd", &["/C", "exit", "7"])
+    }
+
+    #[cfg(unix)]
+    fn success_command() -> BrowserCommand {
+        command("true", &[])
+    }
+
+    #[cfg(windows)]
+    fn success_command() -> BrowserCommand {
+        command("cmd", &["/C", "exit", "0"])
+    }
 }
