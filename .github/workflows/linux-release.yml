@@ -1,0 +1,37 @@
+name: Linux release compatibility
+
+on:
+  workflow_call:
+  pull_request:
+    paths:
+      - '.github/workflows/linux-release.yml'
+      - '.github/workflows/release.yml'
+      - 'scripts/build-linux-release.sh'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - 'HELP.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and verify on Debian 12
+        run: scripts/build-linux-release.sh "${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gh-assigned-linux-${{ matrix.arch }}
+          path: gh-assigned-linux-${{ matrix.arch }}
+          if-no-files-found: error

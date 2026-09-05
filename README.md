@@ -67,6 +67,19 @@ all·fuzzy > query
 
 - [GitHub CLI](https://cli.github.com/) authenticated with `gh auth login`
 
+### Linux
+
+Linux binaries support **amd64 (x86-64)** and **arm64 (AArch64)**, with Debian 12
+as the minimum tested environment. They require **glibc 2.36+** and
+**`libgcc_s.so.1`** (`libc6` and `libgcc-s1` on Debian).
+
+Releases are built on Debian 12 and must pass help-command checks on a clean
+Debian 12 image for both architectures before publishing. See the
+[build and verification script](scripts/build-linux-release.sh).
+
+Older glibc versions, musl-only systems such as Alpine, and 32-bit Linux are
+unsupported. This guarantee applies to releases after v0.2.0.
+
 ## License
 
 MIT
