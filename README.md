@@ -2,6 +2,8 @@
 
 Find the pull requests that need your attention without leaving your terminal. A [GitHub CLI](https://cli.github.com/) extension with fuzzy search, CI status, and keyboard navigation.
 
+![gh-assigned terminal picker showing pull requests, nested stacks, CI status, and review decisions](docs/images/gh-assigned.png)
+
 - **Mine** — your open PRs, with dependent PRs nested under their base PR.
 - **Review requested** — open PRs waiting for your review.
 - **Assigned** — open PRs assigned to you.
