@@ -416,11 +416,7 @@ impl App {
     }
 
     pub fn move_cursor(&mut self, delta: isize) {
-        if self.filtered.is_empty() {
-            self.list_state.select(Some(0));
-            return;
-        }
-        let last = self.filtered.len() - 1;
+        let last = self.filtered.len().saturating_sub(1);
         let next = self.cursor().saturating_add_signed(delta).min(last);
         self.list_state.select(Some(next));
     }
@@ -494,8 +490,7 @@ impl App {
                 })
                 .collect();
             scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-            self.filtered = scored.iter().map(|(_, i, _)| *i).collect();
-            self.hits = scored.into_iter().map(|(_, _, hits)| hits).collect();
+            (self.filtered, self.hits) = scored.into_iter().map(|(_, i, hits)| (i, hits)).unzip();
         }
         let cursor = previous
             .and_then(|key| {
@@ -541,6 +536,23 @@ mod tests {
         app.move_cursor(19);
         app.next_tab();
         assert_eq!(app.selected().unwrap().pr.number, 1);
+    }
+
+    #[test]
+    fn cursor_stays_within_bounds_even_on_an_empty_list() {
+        for count in [0_usize, 1, 3] {
+            let mut app = App::new(Some(snapshot(count, 0)));
+            for (delta, expected) in [
+                (isize::MAX, count.saturating_sub(1)),
+                (1, count.saturating_sub(1)),
+                (isize::MIN, 0),
+                (-1, 0),
+            ] {
+                app.move_cursor(delta);
+                assert_eq!(app.list_state.selected(), Some(expected));
+                assert_eq!(app.selected().is_some(), count > 0);
+            }
+        }
     }
 
     #[test]
@@ -729,13 +741,18 @@ mod tests {
         late.title = "fix the docs".into();
         let mut early = pr(2);
         early.title = "docs fix".into();
-        *snapshot.get_mut(Kind::Mine) = vec![late, early];
+        let mut tied = pr(3);
+        tied.title = "docs again".into();
+        *snapshot.get_mut(Kind::Mine) = vec![late, early, tied];
         let mut app = App::new(Some(snapshot));
         app.next_mode();
         for c in "docs".chars() {
             app.push_char(c);
         }
-        assert_eq!(app.filtered, vec![1, 0]);
+        assert_eq!(app.filtered, vec![1, 2, 0]);
+        assert_eq!(app.highlight(0).title, vec![0, 1, 2, 3]);
+        assert_eq!(app.highlight(1).title, vec![0, 1, 2, 3]);
+        assert_eq!(app.highlight(2).title, vec![8, 9, 10, 11]);
     }
 
     #[test]

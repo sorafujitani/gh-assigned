@@ -496,10 +496,9 @@ mod tests {
         for kind in Kind::ALL {
             let prs = snapshot.get(kind);
             assert!(!prs.is_empty(), "{} should not be empty", kind.label());
-            assert!(
-                prs.iter()
-                    .all(|pr| pr.url.starts_with("https://github.com/"))
-            );
+            assert!(prs
+                .iter()
+                .all(|pr| pr.url.starts_with("https://github.com/")));
             assert!(prs.iter().all(|pr| !pr.title.is_empty()));
             assert!(prs.iter().all(|pr| !pr.author.is_empty()));
         }

@@ -1,10 +1,10 @@
 use crate::app::{App, Status};
 use crate::github::{Checks, Kind, Review};
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph};
+use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const ACCENT: Color = Color::Cyan;
@@ -53,7 +53,11 @@ fn highlighted(text: &str, hits: &[usize], offset: usize, base: Style) -> Vec<Sp
 }
 
 fn style_for(is_hit: bool, base: Style) -> Style {
-    if is_hit { base.patch(hit()) } else { base }
+    if is_hit {
+        base.patch(hit())
+    } else {
+        base
+    }
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -270,8 +274,8 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 String::new()
             };
-            let checks = format!(" {}", checks_mark(pr.checks));
-            let review = format!(" {}", review_mark(pr.review));
+            let checks = checks_span(pr.checks);
+            let review = review_span(pr.review);
 
             let used = pointer.width()
                 + tree.width()
@@ -307,8 +311,8 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 .collect();
             spans.extend(highlighted(&title, &title_hits, 0, title_style));
             spans.push(Span::raw(pad));
-            spans.push(Span::styled(checks, checks_style(pr.checks)));
-            spans.push(Span::styled(review, review_style(pr.review)));
+            spans.push(checks);
+            spans.push(review);
             spans.extend(highlighted(
                 &author,
                 &hl.author,
@@ -345,49 +349,33 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-fn checks_mark(c: Checks) -> &'static str {
-    match c {
-        Checks::Success => "✓",
-        Checks::Failure => "✗",
-        Checks::Pending => "●",
-        Checks::None => " ",
-    }
+fn checks_span(c: Checks) -> Span<'static> {
+    let (text, style) = match c {
+        Checks::Success => (" ✓", accent()),
+        Checks::Failure => (" ✗", Style::new().fg(Color::Red)),
+        Checks::Pending => (" ●", Style::new()),
+        Checks::None => ("  ", dim()),
+    };
+    Span::styled(text, style)
 }
 
-fn checks_style(c: Checks) -> Style {
-    match c {
-        Checks::Success => accent(),
-        Checks::Failure => Style::new().fg(Color::Red),
-        Checks::Pending => Style::new(),
-        Checks::None => dim(),
-    }
-}
-
-fn review_mark(r: Review) -> &'static str {
-    match r {
-        Review::Approved => "approved",
-        Review::ChangesRequested => "changes ",
-        Review::Pending => "review  ",
-        Review::None => "        ",
-    }
-}
-
-fn review_style(r: Review) -> Style {
-    match r {
-        Review::Approved => accent(),
-        Review::ChangesRequested => Style::new().fg(Color::Red),
-        Review::Pending => Style::new(),
-        Review::None => dim(),
-    }
+fn review_span(r: Review) -> Span<'static> {
+    let (text, style) = match r {
+        Review::Approved => (" approved", accent()),
+        Review::ChangesRequested => (" changes ", Style::new().fg(Color::Red)),
+        Review::Pending => (" review  ", Style::new()),
+        Review::None => ("         ", dim()),
+    };
+    Span::styled(text, style)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::github::{Pr, Snapshot};
-    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use ratatui::Terminal;
 
     fn pr(n: u64, base: &str, head: &str, title: &str) -> Pr {
         Pr {
@@ -481,6 +469,38 @@ mod tests {
         assert_eq!(cols.len(), 2, "{out}");
         assert_eq!(cols[0], cols[1], "{out}");
         assert!(out.contains("approved me          "), "{out}");
+    }
+
+    #[test]
+    fn status_columns_keep_their_text_spacing_and_style() {
+        for (checks, review, label, style) in [
+            (Checks::Success, Review::Approved, " ✓ approved", accent()),
+            (
+                Checks::Failure,
+                Review::ChangesRequested,
+                " ✗ changes ",
+                Style::new().fg(Color::Red),
+            ),
+            (
+                Checks::Pending,
+                Review::Pending,
+                " ● review  ",
+                Style::new(),
+            ),
+            (Checks::None, Review::None, "           ", dim()),
+        ] {
+            let mut snapshot = stacked();
+            let pr = &mut snapshot.get_mut(Kind::Mine)[0];
+            pr.checks = checks;
+            pr.review = review;
+            let buf = render_buffer(&mut App::new(Some(snapshot)), 80, 12);
+            for (x, symbol) in (67..78).zip(label.chars()) {
+                let cell = &buf[(x, 2)];
+                assert_eq!(cell.symbol(), symbol.to_string());
+                assert_eq!(cell.fg, style.fg.unwrap_or(Color::Reset));
+                assert_eq!(cell.modifier, style.add_modifier | Modifier::BOLD);
+            }
+        }
     }
 
     #[test]

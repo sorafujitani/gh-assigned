@@ -6,7 +6,7 @@ mod mock;
 mod stack;
 mod ui;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use app::App;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
@@ -14,7 +14,6 @@ use github::{Checks, Kind, PrKey};
 use ratatui::prelude::CrosstermBackend;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::io::{self, IsTerminal};
 use std::process::{Command, ExitCode};
 use std::sync::mpsc;
@@ -440,14 +439,8 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
     bail!("no clipboard command found")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BrowserCommand {
-    program: OsString,
-    args: Vec<OsString>,
-}
-
 fn open_in_browser(url: &str) -> Result<()> {
-    run_browser_command(&browser_command(), url)
+    run_browser_command(browser_command(), url)
 }
 
 fn notify_browser_result(app: &mut App, url: &str, result: Result<()>) {
@@ -455,25 +448,20 @@ fn notify_browser_result(app: &mut App, url: &str, result: Result<()>) {
 }
 
 /// Lets gh apply its configured browser preference and launch policy.
-fn browser_command() -> BrowserCommand {
-    BrowserCommand {
-        program: OsString::from("gh"),
-        args: ["pr", "view"].into_iter().map(OsString::from).collect(),
-    }
+fn browser_command() -> Command {
+    let mut command = Command::new("gh");
+    command.args(["pr", "view"]);
+    command
 }
 
 fn browser_recovery() -> &'static str {
     "try `gh auth login`, then check network access and GH_BROWSER/BROWSER or `gh config get browser`"
 }
 
-fn run_browser_command(command: &BrowserCommand, url: &str) -> Result<()> {
-    let display = command.program.to_string_lossy();
-    let output = Command::new(&command.program)
-        .args(&command.args)
-        .arg(url)
-        .arg("--web")
-        .output()
-        .map_err(|error| {
+fn run_browser_command(mut command: Command, url: &str) -> Result<()> {
+    let output = command.arg(url).arg("--web").output();
+    let display = command.get_program().to_string_lossy();
+    let output = output.map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
                 anyhow!(
                     "could not open {url}: gh command `{display}` was not found; install GitHub CLI; {}",
@@ -525,11 +513,10 @@ mod tests {
         App::new(Some(snapshot))
     }
 
-    fn command(program: &str, args: &[&str]) -> BrowserCommand {
-        BrowserCommand {
-            program: program.into(),
-            args: args.iter().map(|arg| (*arg).into()).collect(),
-        }
+    fn command(program: &str, args: &[&str]) -> Command {
+        let mut command = Command::new(program);
+        command.args(args);
+        command
     }
 
     #[test]
@@ -559,7 +546,7 @@ mod tests {
             panic!("Shift-O should keep the TUI open");
         };
         let command = command("gh-assigned-browser-command-that-does-not-exist", &[]);
-        notify_browser_result(&mut app, &url, run_browser_command(&command, &url));
+        notify_browser_result(&mut app, &url, run_browser_command(command, &url));
         assert!(matches!(app.notice(), Some(Err(error)) if error.contains(URL)));
     }
 
@@ -585,12 +572,13 @@ mod tests {
         permissions.set_mode(0o700);
         fs::set_permissions(&fake_gh, permissions)?;
 
-        let mut command = browser_command();
-        if command.program != "gh" {
+        let command = browser_command();
+        if command.get_program() != "gh" {
             return Err(io::Error::other("browser command should delegate to gh"));
         }
-        command.program = fake_gh.into();
-        let error = match run_browser_command(&command, URL) {
+        let mut fake_command = Command::new(fake_gh);
+        fake_command.args(command.get_args());
+        let error = match run_browser_command(fake_command, URL) {
             Ok(()) => return Err(io::Error::other("fake gh should fail")),
             Err(error) => error.to_string(),
         };
@@ -605,7 +593,7 @@ mod tests {
     #[test]
     fn missing_browser_command_includes_url_and_recovery() {
         let command = command("gh-assigned-browser-command-that-does-not-exist", &[]);
-        let error = run_browser_command(&command, URL).unwrap_err().to_string();
+        let error = run_browser_command(command, URL).unwrap_err().to_string();
         assert!(error.contains(URL));
         assert!(error.contains("was not found"));
         assert!(error.contains("GH_BROWSER/BROWSER"));
@@ -615,7 +603,7 @@ mod tests {
     #[test]
     fn nonzero_browser_exit_includes_url_and_status() {
         let command = nonzero_command();
-        let error = run_browser_command(&command, URL).unwrap_err().to_string();
+        let error = run_browser_command(command, URL).unwrap_err().to_string();
         assert!(error.contains(URL));
         assert!(error.contains("exited with"));
     }
@@ -623,28 +611,28 @@ mod tests {
     #[test]
     fn successful_browser_exit_is_accepted() {
         assert!(matches!(
-            run_browser_command(&success_command(), URL),
+            run_browser_command(success_command(), URL),
             Ok(())
         ));
     }
 
     #[cfg(unix)]
-    fn nonzero_command() -> BrowserCommand {
+    fn nonzero_command() -> Command {
         command("false", &[])
     }
 
     #[cfg(windows)]
-    fn nonzero_command() -> BrowserCommand {
+    fn nonzero_command() -> Command {
         command("cmd", &["/C", "exit", "7"])
     }
 
     #[cfg(unix)]
-    fn success_command() -> BrowserCommand {
+    fn success_command() -> Command {
         command("true", &[])
     }
 
     #[cfg(windows)]
-    fn success_command() -> BrowserCommand {
+    fn success_command() -> Command {
         command("cmd", &["/C", "exit", "0"])
     }
 }
